@@ -7,8 +7,10 @@ Simulates async_result behavior without GPU/multiprocessing to verify:
 1. consecutive_timeouts tracks correctly and resets on success
 2. half-GPU threshold triggers break at the right time
 3. KeyError tasks stay in remaining_tasks and get retried after root-cause restart
+4. RecoverableGpuOom stays unfinished, restarts the pool, and only dummy-fails after
+   MAX_OOM_RESUBMITS
 
-Run: python3 -m unittest op_tests.test_mp_tuner_logic -v
+Run: python3 -m unittest op_tests.tuning_tests.test_mp_tuner_logic -v
 """
 
 import importlib
@@ -16,6 +18,18 @@ import multiprocessing as mp
 import time
 import unittest
 from multiprocessing import TimeoutError as MPTimeoutError
+
+# Keep in sync with aiter.utility.mp_tuner.MAX_OOM_RESUBMITS.
+_MAX_OOM_RESUBMITS = 2
+
+
+def _import_mp_tuner():
+    try:
+        return importlib.import_module("aiter.utility.mp_tuner")
+    except ModuleNotFoundError as exc:
+        if "torch" in str(exc):
+            raise unittest.SkipTest("torch is required to import mp_tuner") from exc
+        raise
 
 
 def _wait_for_release(release, value):
@@ -28,7 +42,8 @@ class FakeAsyncResult:
 
     def __init__(self, behavior, value=None):
         """
-        behavior: "ok", "timeout_pending", "timeout_expired", "keyerror", "accelerator"
+        behavior: "ok", "timeout_pending", "timeout_expired", "keyerror",
+                  "accelerator", "oom"
         value: return value for "ok"
         """
         self.behavior = behavior
@@ -43,9 +58,13 @@ class FakeAsyncResult:
             raise KeyError("12345")
         elif self.behavior == "accelerator":
             raise type("AcceleratorError", (Exception,), {})("GPU fault")
+        elif self.behavior == "oom":
+            raise type("RecoverableGpuOom", (RuntimeError,), {})("CUDA out of memory")
 
 
-def simulate_poll_round(remaining_tasks, task_start_times, mp_num, timeout):
+def simulate_poll_round(
+    remaining_tasks, task_start_times, mp_num, timeout, oom_counts=None
+):
     """
     Simulate one round of the mp_tuner polling loop.
     Returns (completed, dummy_failed, pool_restart_needed, broke_early)
@@ -56,6 +75,8 @@ def simulate_poll_round(remaining_tasks, task_start_times, mp_num, timeout):
     half_gpu = max(1, (mp_num + 1) // 2)
     pool_restart_needed = False
     broke_early = False
+    if oom_counts is None:
+        oom_counts = {}
 
     for k, async_result in remaining_tasks:
         try:
@@ -87,9 +108,19 @@ def simulate_poll_round(remaining_tasks, task_start_times, mp_num, timeout):
         except Exception as e:  # noqa: BLE001
             error_type = type(e).__name__
             is_mapping_error = error_type == "KeyError"
+            is_recoverable_oom = error_type == "RecoverableGpuOom" or (
+                "out of memory" in str(e).lower() and error_type != "AcceleratorError"
+            )
 
             if is_mapping_error:
                 dummy_failed_tasks.append((k, "mapping error"))
+            elif is_recoverable_oom:
+                oom_counts[k] = oom_counts.get(k, 0) + 1
+                if oom_counts[k] <= _MAX_OOM_RESUBMITS:
+                    dummy_failed_tasks.append((k, "oom resubmit"))
+                    pool_restart_needed = True
+                else:
+                    completed_this_round.append((k, async_result))
             elif error_type == "AcceleratorError":
                 completed_this_round.append((k, async_result))
                 pool_restart_needed = True
@@ -301,7 +332,7 @@ class TestAcceleratorError(unittest.TestCase):
 class TestTaskExecutionTiming(unittest.TestCase):
 
     def test_queued_task_has_no_elapsed_execution_time(self):
-        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        tuner = _import_mp_tuner()
         elapsed_since_start = getattr(tuner, "_elapsed_since_task_start", None)
 
         self.assertIsNotNone(
@@ -312,7 +343,7 @@ class TestTaskExecutionTiming(unittest.TestCase):
         self.assertEqual(elapsed_since_start([55.0], 0, now=100.0), 45.0)
 
     def test_worker_records_start_only_when_task_leaves_queue(self):
-        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        tuner = _import_mp_tuner()
         init_start_times = getattr(tuner, "_init_task_start_times", None)
         run_with_tracking = getattr(tuner, "_run_with_start_tracking", None)
 
@@ -357,7 +388,7 @@ class TestTaskExecutionTiming(unittest.TestCase):
 class TestTaskStartTimeReset(unittest.TestCase):
 
     def test_reset_clears_only_the_given_slots(self):
-        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        tuner = _import_mp_tuner()
         reset_start_times = getattr(tuner, "_reset_task_start_times", None)
 
         self.assertIsNotNone(
@@ -373,7 +404,7 @@ class TestTaskStartTimeReset(unittest.TestCase):
 class TestWorkerErrorRatio(unittest.TestCase):
 
     def test_nonfinite_error_ratio_is_rejected(self):
-        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        tuner = _import_mp_tuner()
         merge_error_ratio = getattr(tuner, "_merge_error_ratio", None)
 
         self.assertIsNotNone(
@@ -385,12 +416,121 @@ class TestWorkerErrorRatio(unittest.TestCase):
                 self.assertEqual(merge_error_ratio(0.0, observed), 1.0)
 
     def test_finite_error_ratio_keeps_maximum(self):
-        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        tuner = _import_mp_tuner()
         merge_error_ratio = getattr(tuner, "_merge_error_ratio", None)
 
         self.assertIsNotNone(merge_error_ratio)
         self.assertEqual(merge_error_ratio(0.1, 0.2), 0.2)
         self.assertEqual(merge_error_ratio(0.2, 0.1), 0.2)
+
+
+class TestRecoverableOom(unittest.TestCase):
+
+    def test_oom_stays_in_remaining_and_restarts_pool(self):
+        """First allocator OOM must not commit dummy inf; restart and keep the task."""
+        mp_num = 4
+        timeout = 0.0
+        now = time.time()
+        remaining = [
+            (0, FakeAsyncResult("oom")),
+            (1, FakeAsyncResult("ok", [("info", 1.0, 0.0)])),
+        ]
+        start_times = {k: now - 10 for k, _ in remaining}
+        oom_counts = {}
+
+        completed, dummy, restart, broke = simulate_poll_round(
+            remaining, start_times, mp_num, timeout, oom_counts=oom_counts
+        )
+        completed_ids = {k for k, _ in completed}
+        self.assertNotIn(0, completed_ids, "OOM task should NOT be completed")
+        self.assertIn(1, completed_ids, "OK task should still complete")
+        self.assertTrue(restart, "OOM should recycle the pool")
+        self.assertFalse(broke, "OOM must not drop later completions like GPU fault")
+        self.assertEqual(dummy, [(0, "oom resubmit")])
+        self.assertEqual(oom_counts[0], 1)
+
+        new_remaining = [(k, ar) for k, ar in remaining if k not in completed_ids]
+        self.assertEqual(len(new_remaining), 1)
+        self.assertEqual(new_remaining[0][0], 0)
+
+    def test_oom_dummy_after_resubmit_cap(self):
+        """After MAX_OOM_RESUBMITS, a further OOM may record dummy inf."""
+        mp_num = 4
+        timeout = 0.0
+        now = time.time()
+        remaining = [(0, FakeAsyncResult("oom"))]
+        start_times = {0: now - 10}
+        oom_counts = {}
+
+        for attempt in range(_MAX_OOM_RESUBMITS):
+            completed, dummy, restart, _broke = simulate_poll_round(
+                remaining, start_times, mp_num, timeout, oom_counts=oom_counts
+            )
+            self.assertEqual(completed, [], f"attempt {attempt + 1} must resubmit")
+            self.assertTrue(restart)
+            self.assertEqual(dummy, [(0, "oom resubmit")])
+
+        completed, dummy, restart, _broke = simulate_poll_round(
+            remaining, start_times, mp_num, timeout, oom_counts=oom_counts
+        )
+        self.assertEqual(len(completed), 1, "third OOM may commit dummy inf")
+        self.assertEqual(completed[0][0], 0)
+        self.assertFalse(restart, "giving up must not keep recycling the pool")
+        self.assertEqual(dummy, [])
+        self.assertEqual(oom_counts[0], 3)
+
+    def test_keyerror_retry_unchanged_with_oom_path(self):
+        """Mapping errors still stay unfinished and do not restart by themselves."""
+        mp_num = 4
+        timeout = 0.0
+        now = time.time()
+        remaining = [
+            (0, FakeAsyncResult("keyerror")),
+            (1, FakeAsyncResult("ok", [("info", 1.0, 0.0)])),
+        ]
+        start_times = {k: now - 10 for k, _ in remaining}
+
+        completed, dummy, restart, _broke = simulate_poll_round(
+            remaining, start_times, mp_num, timeout
+        )
+        completed_ids = {k for k, _ in completed}
+        self.assertNotIn(0, completed_ids)
+        self.assertIn(1, completed_ids)
+        self.assertEqual(dummy, [(0, "mapping error")])
+        self.assertFalse(restart)
+
+
+class TestOomHelpers(unittest.TestCase):
+
+    def setUp(self):
+        self.tuner = _import_mp_tuner()
+
+    def test_oom_helpers_detect_allocator_errors(self):
+        tuner = self.tuner
+        oom = tuner.RecoverableGpuOom("CUDA out of memory")
+        cuda_oom = type("OutOfMemoryError", (RuntimeError,), {})(
+            "HIP out of memory. Tried to allocate 280.00 MiB"
+        )
+        self.assertTrue(tuner._is_oom_error(oom))
+        self.assertTrue(tuner._is_oom_error(cuda_oom))
+        self.assertTrue(tuner._is_recoverable_oom(oom))
+        self.assertTrue(tuner._is_recoverable_oom(cuda_oom))
+        self.assertFalse(tuner._is_recoverable_oom(KeyError("12345")))
+        self.assertFalse(
+            tuner._is_recoverable_oom(
+                type("AcceleratorError", (Exception,), {})("GPU fault")
+            )
+        )
+
+    def test_oom_resubmit_cap(self):
+        tuner = self.tuner
+        counts = {}
+        self.assertTrue(tuner._should_resubmit_oom(counts, 7))
+        self.assertTrue(tuner._should_resubmit_oom(counts, 7))
+        self.assertFalse(tuner._should_resubmit_oom(counts, 7))
+        self.assertEqual(counts[7], 3)
+        self.assertEqual(tuner.MAX_OOM_RESUBMITS, _MAX_OOM_RESUBMITS)
+        self.assertEqual(tuner.TUNER_NUM_ROTATE_ARGS, 2)
 
 
 if __name__ == "__main__":
