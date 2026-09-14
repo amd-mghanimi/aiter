@@ -972,7 +972,13 @@ class GemmA16W16Tuner(GemmCommonTuner):
         with_hipblaslt = getattr(args, "with_hipblaslt", False)
         gfx = self.get_gfx()
         cu_num = self.get_cu_num()
-        run_kwargs = {"num_warmup": args.warmup, "num_iters": args.iters}
+        run_kwargs = {
+            "num_warmup": args.warmup,
+            "num_iters": args.iters,
+            "num_rotate_args": getattr(
+                args, "rotate_args", self.ARG_DEFAULTS["rotate_args"]
+            ),
+        }
         self._flydsl_space = getattr(args, "flydsl_space", "base")
         self._flydsl_hip_map = _load_flydsl_hip_map(
             getattr(args, "flydsl_hip_map", "")
