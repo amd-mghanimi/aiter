@@ -25,6 +25,7 @@ from aiter import dtypes, logger
 from aiter.jit.core import AITER_CONFIG_GEMM_BF16, get_asm_dir
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.flydsl.gemm_a16w16_policy import (
+    FLYDSL_A16W16_SPACES,
     get_flydsl_a16w16_configs,
 )
 from aiter.ops.flydsl.gemm_kernels import (
@@ -325,17 +326,43 @@ def run_flydsl_gemm_bf16(
 # ---------------------------------------------------------------------------
 
 
-@lru_cache(maxsize=1)
+def _load_flydsl_hip_map(path: str) -> dict[tuple[int, int, int], str]:
+    if not path:
+        return {}
+    df = pd.read_csv(path)
+    mapping = {}
+    for row in df.itertuples(index=False):
+        kernel = getattr(row, "kernelName", "")
+        if kernel is None or (isinstance(kernel, float) and kernel != kernel):
+            continue
+        kernel = str(kernel).strip()
+        if not kernel or kernel.lower() == "nan":
+            continue
+        mapping[(int(row.M), int(row.N), int(row.K))] = kernel
+    return mapping
+
+
+@lru_cache(maxsize=32)
 def get_flydsl_bf16_catalog(
     m: int,
     n: int,
     k: int,
     out_dtype: torch.dtype,
     has_bias: bool,
+    space: str = "base",
+    hipblaslt_kernel: str = "",
 ):
     if flydsl_hgemm_kernel_name is None:
         return []
     fused_bias = bool(has_bias and out_dtype == torch.bfloat16)
+    kernel = hipblaslt_kernel or None
+    catalog_space = space
+    if space == "subspace" and not kernel:
+        logger.warning(
+            f"FlyDSL subspace requested for M={m}, N={n}, K={k} without a "
+            "hipBLASLt kernel; falling back to base"
+        )
+        catalog_space = "base"
     configs = get_flydsl_a16w16_configs(
         m,
         n,
@@ -343,6 +370,8 @@ def get_flydsl_bf16_catalog(
         torch.bfloat16,
         out_dtype,
         fused_bias,
+        space=catalog_space,
+        hipblaslt_kernel=kernel,
     )
     kernels = {
         flydsl_hgemm_kernel_name(
@@ -473,6 +502,24 @@ class GemmA16W16Tuner(GemmCommonTuner):
             dest="with_hipblaslt",
             help="Include hipblaslt in tuning (disabled by default). "
             "hipblaslt tuning is also available standalone via gradlib/gradlib/gemm_tuner.py.",
+        )
+        self.parser.add_argument(
+            "--flydsl-space",
+            type=str,
+            default="base",
+            choices=list(FLYDSL_A16W16_SPACES),
+            dest="flydsl_space",
+            help="FlyDSL policy catalog: base (original lists), extended "
+            "(all extra tiles/k_waves), or subspace (base plus extras "
+            "derived from --flydsl-hip-map).",
+        )
+        self.parser.add_argument(
+            "--flydsl-hip-map",
+            type=str,
+            default="",
+            dest="flydsl_hip_map",
+            help="CSV with columns M,N,K,kernelName used when "
+            "--flydsl-space=subspace to select the extended subset.",
         )
 
     def _clear_op_caches(self):
@@ -740,7 +787,11 @@ class GemmA16W16Tuner(GemmCommonTuner):
             return []
         M, N, K = (int(info_keys[2]), int(info_keys[3]), int(info_keys[4]))
         rtol, atol = _default_tol(outdtype)
-        flydsl_catalog = get_flydsl_bf16_catalog(M, N, K, outdtype, has_bias)
+        space = getattr(self, "_flydsl_space", "base")
+        hip_kernel = getattr(self, "_flydsl_hip_map", {}).get((M, N, K), "")
+        flydsl_catalog = get_flydsl_bf16_catalog(
+            M, N, K, outdtype, has_bias, space, hip_kernel
+        )
         tasks = []
         for solidx, kernel_name, config in flydsl_catalog:
             info = (
@@ -921,7 +972,21 @@ class GemmA16W16Tuner(GemmCommonTuner):
         with_hipblaslt = getattr(args, "with_hipblaslt", False)
         gfx = self.get_gfx()
         cu_num = self.get_cu_num()
-        run_kwargs = {"num_warmup": 10, "num_iters": 101}
+        run_kwargs = {
+            "num_warmup": args.warmup,
+            "num_iters": args.iters,
+            "num_rotate_args": getattr(
+                args, "rotate_args", self.ARG_DEFAULTS["rotate_args"]
+            ),
+        }
+        self._flydsl_space = getattr(args, "flydsl_space", "base")
+        self._flydsl_hip_map = _load_flydsl_hip_map(
+            getattr(args, "flydsl_hip_map", "")
+        )
+        logger.info(
+            f"FlyDSL space={self._flydsl_space} "
+            f"hip_map_shapes={len(self._flydsl_hip_map)}"
+        )
 
         task = []
         tasks_data = []

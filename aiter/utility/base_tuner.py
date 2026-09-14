@@ -51,6 +51,9 @@ class TunerCommon:
         "timeout": 1800,
         "warmup": 5,  # 5 warmup iters for profiling
         "iters": 101,  # 101 run iters for profiling
+        # Bounded rotate copies for timing. 0 restores perftest's auto sizing,
+        # which fills ~90% of free VRAM with deep copies of the problem tensors.
+        "rotate_args": 2,
         "min_improvement_pct": 3.0,  # only write shapes improved by >= N%
     }
     dtype2bpe_dict: ClassVar[dict[str, Any]] = {
@@ -195,6 +198,17 @@ class TunerCommon:
             type=int,
             default=defaults["iters"],
             help="run iters for profiling",
+        )
+        self.parser.add_argument(
+            "--rotate-args",
+            type=int,
+            default=defaults["rotate_args"],
+            dest="rotate_args",
+            help="number of rotating copies of the problem tensors used to "
+            "keep timing off a fully cache-hot path. 0 selects perftest's auto "
+            "sizing, which fills ~90%% of free VRAM and can exhaust the "
+            "allocator on later kernels. Higher values give a colder cache at "
+            "the cost of memory.",
         )
         self.parser.add_argument(
             "--timeout",
