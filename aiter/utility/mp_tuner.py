@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+import gc
 import math
 import multiprocessing as mp
 import time
@@ -12,6 +13,16 @@ from aiter.test_common import checkAllclose
 
 _TASK_START_TIMES = None
 
+# Allocator OOM on problem-tensor alloc is not proof the candidate is too large.
+# Resubmit on a recycled pool this many times before recording dummy inf.
+MAX_OOM_RESUBMITS = 2
+# Bounded rotate copies for tuner timing. 0 means auto-fill ~90% of free VRAM.
+TUNER_NUM_ROTATE_ARGS = 2
+
+
+class RecoverableGpuOom(RuntimeError):
+    """Allocator OOM that is not proof the candidate kernel is too large."""
+
 
 def _is_mapping_error(exc: BaseException) -> bool:
     return isinstance(exc, KeyError)
@@ -19,6 +30,34 @@ def _is_mapping_error(exc: BaseException) -> bool:
 
 def _is_accelerator_error(exc: BaseException) -> bool:
     return type(exc).__name__ == "AcceleratorError"
+
+
+def _is_oom_error(exc: BaseException) -> bool:
+    if isinstance(exc, RecoverableGpuOom):
+        return True
+    if type(exc).__name__ in ("OutOfMemoryError", "HIPOutOfMemoryError"):
+        return True
+    return "out of memory" in str(exc).lower()
+
+
+def _is_recoverable_oom(exc: BaseException) -> bool:
+    if _is_accelerator_error(exc) or _is_mapping_error(exc):
+        return False
+    return isinstance(exc, RecoverableGpuOom) or _is_oom_error(exc)
+
+
+def _should_resubmit_oom(oom_counts, task_index, max_resubmits=MAX_OOM_RESUBMITS):
+    oom_counts[task_index] = oom_counts.get(task_index, 0) + 1
+    return oom_counts[task_index] <= max_resubmits
+
+
+def _release_gpu_working_set():
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _init_task_start_times(task_start_times):
@@ -93,11 +132,22 @@ def worker(
         torch.cuda.synchronize()
         res = None
         us = float("inf")
+        perf_kwargs = dict(kwargs)
+        perf_kwargs.setdefault("num_rotate_args", TUNER_NUM_ROTATE_ARGS)
         try:
-            res, us = run_perftest(func, *args, **kwargs)
+            res, us = run_perftest(func, *args, **perf_kwargs)
             us = round(us, 4)
 
         except (RuntimeError, ValueError) as e:
+            if _is_oom_error(e):
+                try:
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                except Exception:  # noqa: BLE001
+                    pass
+                raise RecoverableGpuOom(
+                    f"GPU OOM while timing kernel info:{info}: {e}"
+                ) from e
             print(f"run gpu func warning: info:{info}\t {e}", flush=True)
             us = -1  # not support or error
             max_err_ratio = 1.0
@@ -106,7 +156,7 @@ def worker(
 
         while us == 0 and retry_count < max_retries:
             print(f"!!!! us = 0, try {retry_count + 1} run")
-            res, us = run_perftest(func, *args, **kwargs)
+            res, us = run_perftest(func, *args, **perf_kwargs)
             retry_count += 1
         if us == 0:
             print(f"Warning: try run {max_retries} times, but still get 0!")
@@ -156,17 +206,22 @@ def worker(
                             catastrophic_check=catastrophic_check,
                         )
                     max_err_ratio = _merge_error_ratio(max_err_ratio, err_ratio)
+    except RecoverableGpuOom:
+        raise
     except RuntimeError as e:
-        if "CUDA" in str(e) or "HIP" in str(e) or "out of memory" in str(e).lower():
+        if _is_oom_error(e) or "CUDA" in str(e) or "HIP" in str(e):
             if printLog:
                 print(f"GPU Runtime Error in process:{pid} info:{info}: {e}")
-            # Try to recover GPU state
             try:
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
-            except Exception as e:  # noqa: BLE001  blanket catch is intentional here
+            except Exception as cache_err:  # noqa: BLE001
                 if printLog:
-                    print(f"Error in process:{pid} info:{info}: {e}")
+                    print(f"Error in process:{pid} info:{info}: {cache_err}")
+            if _is_oom_error(e):
+                raise RecoverableGpuOom(
+                    f"GPU OOM in process:{pid} info:{info}: {e}"
+                ) from e
         else:
             print(f"Runtime Error in process:{pid} info:{info}: {e}")
         us = -1  # float("inf")
@@ -219,6 +274,14 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
     cached_ref = ref
     cached_ref_key = None
 
+    def drop_working_set():
+        nonlocal data, data_key, cached_ref, cached_ref_key
+        data = None
+        data_key = None
+        cached_ref = None
+        cached_ref_key = None
+        _release_gpu_working_set()
+
     def make_data_key(cur_gen_data, cur_gen_args):
         def normalize(arg):
             if isinstance(arg, torch.Tensor):
@@ -233,15 +296,33 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
 
         return (id(cur_gen_data), normalize(cur_gen_args))
 
+    def _alloc_data(cur_gen_data, cur_gen_args):
+        return (
+            cur_gen_data(*cur_gen_args, device=device)
+            if not input_data and cur_gen_data is not None
+            else input_data
+        )
+
     def ensure_data(cur_gen_data, cur_gen_args):
         nonlocal data, data_key, cached_ref_key
         cur_data_key = make_data_key(cur_gen_data, cur_gen_args)
         if cur_data_key != data_key:
-            data = (
-                cur_gen_data(*cur_gen_args, device=device)
-                if not input_data and cur_gen_data is not None
-                else input_data
-            )
+            if data is not None:
+                drop_working_set()
+            try:
+                data = _alloc_data(cur_gen_data, cur_gen_args)
+            except Exception as e:  # noqa: BLE001
+                if not _is_oom_error(e):
+                    raise
+                drop_working_set()
+                try:
+                    data = _alloc_data(cur_gen_data, cur_gen_args)
+                except Exception as e2:  # noqa: BLE001
+                    if _is_oom_error(e2):
+                        raise RecoverableGpuOom(
+                            f"GPU OOM allocating problem tensors: {e2}"
+                        ) from e2
+                    raise
             data_key = cur_data_key
             cached_ref_key = None
         return data
@@ -345,6 +426,8 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
             rets.append(ret)
         return rets
 
+    except RecoverableGpuOom:
+        raise
     except Exception as e:  # noqa: BLE001
         import traceback
 
@@ -357,6 +440,8 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
             ]
         else:
             return [(tasks[0] if tasks else "unknown", float("inf"), 1.0)]
+    finally:
+        drop_working_set()
 
 
 def get_pid():
@@ -376,9 +461,10 @@ def mp_tuner(
 ):
     """Multi-process tuner with GPU fault isolation.
 
-    Each task runs in an isolated process (maxtasksperchild=1) to ensure that
-    GPU memory faults or hangs in one task don't affect others. The process pool
-    automatically spawns new workers after each task completes or crashes.
+    Workers persist across tasks (spawn/JIT cost dominates a large GEMM search
+    if maxtasksperchild=1). Allocator OOM is treated as recoverable: the task
+    stays unfinished, the pool is recycled, and the candidate is resubmitted
+    up to MAX_OOM_RESUBMITS times instead of being recorded as inf.
 
     Args:
         tasks: List of tuning tasks
@@ -501,6 +587,7 @@ def mp_tuner(
 
     # Process tasks as they complete
     pool_restart_needed = False
+    oom_resubmit_counts = {}
     logged_error_types = (
         set()
     )  # Track error types that already logged to avoid duplicates
@@ -579,10 +666,34 @@ def mp_tuner(
                 error_type = type(e).__name__
                 is_mapping_error = _is_mapping_error(e)
                 is_accelerator_error = _is_accelerator_error(e)
+                is_recoverable_oom = _is_recoverable_oom(e)
                 # not restart as this is not root use
                 if is_mapping_error:
                     error_msg = f"[Mapping Error] Task {k} - Process PID not in GPU map: {error_type} - {e}"
                     dummy_failed_tasks.append((k, "mapping error"))
+                elif is_recoverable_oom:
+                    if _should_resubmit_oom(oom_resubmit_counts, k):
+                        error_msg = (
+                            f"[OOM] Task {k} allocator OOM "
+                            f"(attempt {oom_resubmit_counts[k]}/{MAX_OOM_RESUBMITS}); "
+                            f"recycle pool and resubmit: {error_type} - {e}"
+                        )
+                        print(error_msg, flush=True)
+                        dummy_failed_tasks.append((k, "oom resubmit"))
+                        pool_restart_needed = True
+                    else:
+                        error_msg = (
+                            f"[OOM] Task {k} exceeded {MAX_OOM_RESUBMITS} "
+                            f"OOM resubmits; recording dummy inf: {e}"
+                        )
+                        print(error_msg, flush=True)
+                        failed_tasks.append((k, "oom"))
+                        dummy_results = []
+                        add_dummy_result(k, dummy_results)
+                        result_dict[k] = (
+                            dummy_results if shape_grouped else [dummy_results[0]]
+                        )
+                        completed_this_round.append((k, async_result))
                 elif is_accelerator_error:
                     # GPU fault (e.g. illegal memory access): worker returns exception instead of
                     # hanging. Unlike hang->timeout, the faulting worker may stay alive and accept
