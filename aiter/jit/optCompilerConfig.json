@@ -149,6 +149,19 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
+    "module_latent_ag_mailbox": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/latent_ag_mailbox_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/latent_ag_mailbox.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
     "module_custom_all_reduce_gfx1250": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/custom_all_reduce_gfx1250_pybind.cu'",
