@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "rocm_ops.hpp"
+#include "aiter_stream.h"
 #include "latent_ag_mailbox.h"
 
 #define LATENT_AG_MAILBOX_PYBIND                                                     \
