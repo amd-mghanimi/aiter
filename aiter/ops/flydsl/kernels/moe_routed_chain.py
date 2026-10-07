@@ -834,7 +834,10 @@ def _shared_gate_up(
         acc_g = _mfma_bf16(a, _bf16x8(w_rsrc, g_dw + fx.Int32(s * 16)), acc_g)
         acc_u = _mfma_bf16(a, _bf16x8(w_rsrc, u_dw + fx.Int32(s * 16)), acc_u)
 
-    part_rsrc = buffer_ops.create_buffer_resource_from_addr(fx.Int64(arg_part))
+    # Masked buffer stores move the offset to 0x7FFFFFFF: every store resource needs
+    # its real extent so the hardware drops them.
+    part_rsrc = buffer_ops.create_buffer_resource_from_addr(
+        fx.Int64(arg_part), num_records_bytes=N_SLICES * BM * 2 * SH_INTER * 4)
     col = p * fx.Int32(16) + row
     slice_row0 = (ks * fx.Int32(N_WAVES) + wave) * fx.Int32(BM)
     for r in range_constexpr(4):
@@ -865,7 +868,7 @@ def _shared_gate_up(
             gate = fx.Float32(beta) * tanh_f32(g * fx.Float32(1.0 / beta)) * sigmoid_f32(g)
             if const_expr(linear_beta > 0):
                 up = fx.Float32(linear_beta) * tanh_f32(up * fx.Float32(1.0 / linear_beta))
-            h_rsrc = buffer_ops.create_buffer_resource_from_addr(fx.Int64(arg_h))
+            h_rsrc = buffer_ops.create_buffer_resource_from_addr(fx.Int64(arg_h), num_records_bytes=BM * SH_INTER * 2)
             buffer_ops.buffer_store(_raw((gate * up).to(fx.BFloat16)), h_rsrc,
                                     _raw(m * fx.Int32(SH_INTER) + c))
         rocdl.s_waitcnt(vmcnt=0)
@@ -884,7 +887,8 @@ def _shared_down(
     h_rsrc = buffer_ops.create_buffer_resource_from_addr(
         fx.Int64(arg_h), num_records_bytes=fx.Int64(i32_M) * fx.Int64(SH_INTER * 2))
     w_rsrc = buffer_ops.create_buffer_resource_from_addr(fx.Int64(arg_w))
-    o_rsrc = buffer_ops.create_buffer_resource_from_addr(fx.Int64(arg_out))
+    o_rsrc = buffer_ops.create_buffer_resource_from_addr(
+        fx.Int64(arg_out), num_records_bytes=fx.Int64(i32_M) * fx.Int64(SH_HIDDEN * 2))
     h_dw = row * fx.Int32(SH_INTER // 2) + kq * fx.Int32(4)
     for sub in range_constexpr(SH_DN_BN // (16 * N_WAVES)):
         n0 = nb * fx.Int32(SH_DN_BN) + (fx.Int32(sub * N_WAVES) + wave) * fx.Int32(16)
