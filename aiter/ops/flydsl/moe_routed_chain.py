@@ -24,12 +24,15 @@ from .kernels.mxfp4_gemm_common import kas_per_chunk_dw_for
 
 FUSED_M_MAX = 32
 G1_BN = 128
-G2_BN = 256
+# Wide gemm2 tiles amortise the per-tile wait and setup; 512 needs hidden % 512 == 0.
+G2_BN = 512
 
 
 @functools.cache
 def _launcher(m_max, ne, topk, hidden, inter, g1_bn, beta, linear_beta, trace=False,
               route_only=False, g2_bn=G2_BN):
+    if hidden % g2_bn:
+        g2_bn = 256
     return compile_routed_chain(
         M_MAX=m_max, NE=ne, TOPK=topk, D_HIDDEN=hidden, D_INTER=inter, G1_BN=g1_bn, G2_BN=g2_bn,
         situ_beta=beta, situ_linear_beta=linear_beta, TRACE=trace, ROUTE_ONLY=route_only,
