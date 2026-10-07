@@ -54,6 +54,8 @@ CTRL_ROUTED = 1
 CTRL_DONE = 2
 CTRL_TOPK = 3
 CTRL_MBLOCK = 16
+# CTRL_PAD layout: each control word on its own 128-byte line.
+LINE_WORDS = 32
 
 
 def max_m_blocks(m, topk):
@@ -61,7 +63,7 @@ def max_m_blocks(m, topk):
 
 
 def ctrl_words(m_max, topk):
-    return CTRL_MBLOCK + max_m_blocks(m_max, topk)
+    return LINE_WORDS * (4 + max_m_blocks(m_max, topk))
 
 
 def _lds_i32(base, off_words):
@@ -81,10 +83,10 @@ def _rcp(x):
 
 
 @comm_ops.traced
-def _spin_ge(addr_i64, val):
+def _spin_ge(addr_i64, val, sleep):
     cur = fx.Int32(comm_ops.load_i32_global_agent(addr_i64))
     while cur < fx.Int32(val):
-        rocdl.s_sleep(SPIN_SLEEP)
+        rocdl.s_sleep(sleep)
         cur = fx.Int32(comm_ops.load_i32_global_agent(addr_i64))
     return cur
 
@@ -185,7 +187,7 @@ def _store(wt, base_i64, ptr, index, val, nbytes):
 
 
 @comm_ops.traced
-def _wait_ge(wave, addr, val, l1_only=False):
+def _wait_ge(wave, addr, val, l1_only=False, sleep=SPIN_SLEEP):
     """Spin until a control word reaches val, then acquire.
 
     l1_only drops only this CU's L1. That is enough when everything the word
@@ -193,7 +195,7 @@ def _wait_ge(wave, addr, val, l1_only=False):
     this launch read those lines earlier: the dispatch already invalidated L2.
     """
     if wave == fx.Int32(0):
-        _spin_ge(addr, val)
+        _spin_ge(addr, val, sleep)
         if const_expr(l1_only):
             rocdl.s_waitcnt(vmcnt=0)
             _llvm.InlineAsmOp(None, [], "buffer_inv sc0", "", has_side_effects=True)
@@ -524,6 +526,8 @@ def compile_routed_chain(
     LDS_PAD=0,
     ACQ_MBLOCK_L1=True,
     WT_INTER=True,
+    SPIN=SPIN_SLEEP,
+    CTRL_PAD=True,
 ):
     """Compile the fused chain; returns the launcher.
 
@@ -573,11 +577,17 @@ def compile_routed_chain(
         f"moe_routed_chain_m{M_MAX}_ne{NE}_k{TOPK}_h{D_HIDDEN}_i{D_INTER}"
         f"_g1bn{G1_BN}{'_hpf' if G1_PREFETCH_HIDDEN else ''}_g2bn{G2_BN}{'_nt' if G2_USE_NT else ''}"
         f"{'_trace' if TRACE else ''}{'_routeonly' if ROUTE_ONLY else ''}"
-    f"{'_g1only' if GEMM1_ONLY else ''}{'_empty' if EMPTY else ''}{'_wtr' if WT_ROUTE else ''}{'_1l' if ONE_LANE else ''}{'_aql1' if ACQ_ROUTE_L1 else ''}{'_pvb' if PIVOT_BALLOT else ''}{f'_pad{LDS_PAD}' if LDS_PAD else ''}{'_aqm1' if ACQ_MBLOCK_L1 else ''}{'_wti' if WT_INTER else ''}"
+    f"{'_g1only' if GEMM1_ONLY else ''}{'_empty' if EMPTY else ''}{'_wtr' if WT_ROUTE else ''}{'_1l' if ONE_LANE else ''}{'_aql1' if ACQ_ROUTE_L1 else ''}{'_pvb' if PIVOT_BALLOT else ''}{f'_pad{LDS_PAD}' if LDS_PAD else ''}{'_aqm1' if ACQ_MBLOCK_L1 else ''}{'_wti' if WT_INTER else ''}{f'_spin{SPIN}' if SPIN != SPIN_SLEEP else ''}{'_cpad' if CTRL_PAD else ''}"
     )
 
     # FlyDSL keys its compile cache on sources and scalar closure values; the
     # knob dicts reach the kernel only through calls, so key on them here.
+    if CTRL_PAD:
+        W_TICKET, W_ROUTED, W_DONE, W_TOPK = 0, LINE_WORDS, 2 * LINE_WORDS, 3 * LINE_WORDS
+        W_MBLOCK, MB_STRIDE = 4 * LINE_WORDS, LINE_WORDS
+    else:
+        W_TICKET, W_ROUTED, W_DONE, W_TOPK, W_MBLOCK, MB_STRIDE = (
+            CTRL_TICKET, CTRL_ROUTED, CTRL_DONE, CTRL_TOPK, CTRL_MBLOCK, 1)
     cache_tag = repr((name, sorted(topk_kw.items()), sorted(sort_kw.items()), sorted(g1_kw.items())))
 
     def compose(*, module_name, emit_gemm2_tile, shared_storage):
@@ -630,11 +640,11 @@ def compile_routed_chain(
             lds_base = fx.Int32(ptrtoint(route_lds))
 
             ctrl = fx.Int64(arg_ctrl)
-            a_ticket = ctrl + fx.Int64(CTRL_TICKET * 4)
-            a_routed = ctrl + fx.Int64(CTRL_ROUTED * 4)
-            a_done = ctrl + fx.Int64(CTRL_DONE * 4)
-            a_topk = ctrl + fx.Int64(CTRL_TOPK * 4)
-            a_mblock = ctrl + fx.Int64(CTRL_MBLOCK * 4)
+            a_ticket = ctrl + fx.Int64(W_TICKET * 4)
+            a_routed = ctrl + fx.Int64(W_ROUTED * 4)
+            a_done = ctrl + fx.Int64(W_DONE * 4)
+            a_topk = ctrl + fx.Int64(W_TOPK * 4)
+            a_mblock = ctrl + fx.Int64(W_MBLOCK * 4)
 
             def mark(t, k):
                 if const_expr(TRACE):
@@ -661,7 +671,7 @@ def compile_routed_chain(
                     rmark(9)
                     mark(t, 1)
                     if n_topk == i32_M - fx.Int32(1):
-                        _wait_ge(wave, a_topk, i32_M, ACQ_ROUTE_L1 and WT_ROUTE)
+                        _wait_ge(wave, a_topk, i32_M, ACQ_ROUTE_L1 and WT_ROUTE, SPIN)
                         rmark(0)
                         _sort_routes(
                             lds_base, arg_tw, arg_ti, arg_stids, arg_sw, arg_eids, arg_cumsum,
@@ -674,7 +684,7 @@ def compile_routed_chain(
                     mark(t, 2)
                     t = _grab(wave, lane, lds_base, a_ticket, L_TICKET + 4, ONE_LANE)
 
-                _wait_ge(wave, a_routed, fx.Int32(1), ACQ_ROUTE_L1 and WT_ROUTE)
+                _wait_ge(wave, a_routed, fx.Int32(1), ACQ_ROUTE_L1 and WT_ROUTE, SPIN)
                 total_mb = fx.Int32(global_typed_ptr(arg_cumsum, T.i32)[0]) // fx.Int32(BM)
                 n_g1 = total_mb * fx.Int32(NNB1)
                 n_work = i32_M + n_g1 + total_mb * fx.Int32(NNB2)
@@ -696,13 +706,13 @@ def compile_routed_chain(
                                 True, i32_M, total_mb, **g1_kw,
                             )
                             rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
-                            _bump(wave, lane, a_mblock + fx.Int64(mb1) * fx.Int64(4), ONE_LANE, not WT_INTER)
+                            _bump(wave, lane, a_mblock + fx.Int64(mb1) * fx.Int64(4 * MB_STRIDE), ONE_LANE, not WT_INTER)
                             mark(t, 2)
                         if wk >= n_g1:
                             u = wk - n_g1
                             mb2 = u // fx.Int32(NNB2)
                             nb2 = u - mb2 * fx.Int32(NNB2)
-                            _wait_ge(wave, a_mblock + fx.Int64(mb2) * fx.Int64(4), fx.Int32(NNB1), ACQ_MBLOCK_L1)
+                            _wait_ge(wave, a_mblock + fx.Int64(mb2) * fx.Int64(4 * MB_STRIDE), fx.Int32(NNB1), ACQ_MBLOCK_L1, SPIN)
                             mark(t, 1)
                             emit_gemm2_tile(
                                 arg_inter, arg_inter_scale, arg_w2, arg_w2s, arg_eids, arg_stids,
@@ -719,12 +729,12 @@ def compile_routed_chain(
             if n_done == i32_grid - fx.Int32(1):
                 ctrl32 = global_typed_ptr(arg_ctrl, T.i32)
                 for i in range(tid, mb_max, fx.Int32(THREADS)):
-                    ctrl32[fx.Int32(CTRL_MBLOCK) + i] = fx.Int32(0)
+                    ctrl32[fx.Int32(W_MBLOCK) + i * fx.Int32(MB_STRIDE)] = fx.Int32(0)
                 if tid == fx.Int32(0):
-                    ctrl32[CTRL_TICKET] = fx.Int32(0)
-                    ctrl32[CTRL_ROUTED] = fx.Int32(0)
-                    ctrl32[CTRL_DONE] = fx.Int32(0)
-                    ctrl32[CTRL_TOPK] = fx.Int32(0)
+                    ctrl32[W_TICKET] = fx.Int32(0)
+                    ctrl32[W_ROUTED] = fx.Int32(0)
+                    ctrl32[W_DONE] = fx.Int32(0)
+                    ctrl32[W_TOPK] = fx.Int32(0)
 
         @flyc.jit
         def launch_routed_chain(
