@@ -392,6 +392,9 @@ def _topk_token(
         ec = ok.select(e, fx.Int32(0))
         x = fx.Float32(logits[row + ec])
         s = _rcp(fx.Float32(1.0) + (x * fx.Float32(-LOG2E)).exp2())
+        # A NaN score would make the pivot NaN and select nothing, leaving the
+        # token's ids unwritten for the sort (padded graph rows can be NaN).
+        s = (s == s).select(s, fx.Float32(0.0))
         ids.append(e)
         sig.append(s)
         choice.append(ok.select(s + fx.Float32(bias[ec]), neg_inf))
@@ -516,7 +519,8 @@ def _topk_token(
                 tot = tot + tot.shuffle_xor(fx.Int32(1 << sh), fx.Int32(WAVE))
             if sel:
                 _store(WT, arg_ti, ti, tok * fx.Int32(TOPK) + rank, fx.Int32(s_ci[lane]), 4)
-                _store(WT, arg_tw, tw, tok * fx.Int32(TOPK) + rank, sv / tot, 4)
+                _store(WT, arg_tw, tw, tok * fx.Int32(TOPK) + rank,
+                       (tot > fx.Float32(0.0)).select(sv / tot, fx.Float32(0.0)), 4)
     if w_on:
         mine = lane < fx.Int32(TOPK)
         sv = mine.select(fx.Float32(s_sel[lane & fx.Int32(TOPK - 1)]), fx.Float32(0.0))
@@ -524,7 +528,8 @@ def _topk_token(
         for sh in range_constexpr(6):
             tot = tot + tot.shuffle_xor(fx.Int32(1 << sh), fx.Int32(WAVE))
         if mine:
-            _store(WT, arg_tw, tw, tok * fx.Int32(TOPK) + lane, sv / tot, 4)
+            _store(WT, arg_tw, tw, tok * fx.Int32(TOPK) + lane,
+                   (tot > fx.Float32(0.0)).select(sv / tot, fx.Float32(0.0)), 4)
     tmark(7)
 
 
