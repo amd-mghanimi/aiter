@@ -803,7 +803,7 @@ def compile_routed_chain(
     SORT_DISTINCT=True,
     RANK_SPLIT=True,
     CAND_BALLOT=True,
-    WS_PACK=False,
+    WS_PACK=True,
 ):
     """Compile the fused chain; returns the launcher.
 
