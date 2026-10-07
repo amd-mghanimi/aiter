@@ -23,6 +23,9 @@ from .kernels.moe_routed_chain import BM, compile_routed_chain, ctrl_words, max_
 from .kernels.mxfp4_gemm_common import kas_per_chunk_dw_for
 
 FUSED_M_MAX = 32
+# Above this M the two-kernel path wins (MI355X: M=32 144 vs 162 us); routed_chain still
+# fuses up to FUSED_M_MAX when called directly.
+FUSED_M_DISPATCH = 16
 G1_BN = 128
 # Wide gemm2 tiles amortise the per-tile wait and setup; 512 needs hidden % 512 == 0.
 G2_BN = 512
@@ -79,10 +82,10 @@ def _workspace(device, m_max, topk, inter):
     return ws
 
 
-def fused_supported(m, ne, topk, hidden, inter):
+def fused_supported(m, ne, topk, hidden, inter, m_max=FUSED_M_DISPATCH):
     """The kernel is the a4w4 path: fused_moe must be on it too (AITER_SITUV2_A4W4)."""
     return (
-        1 <= m <= FUSED_M_MAX
+        1 <= m <= m_max
         and ne % 64 == 0
         and topk <= 64
         and inter % 128 == 0
@@ -136,7 +139,7 @@ def routed_chain(
         topk_weights = torch.empty((m, topk), dtype=torch.float32, device=device)
     if topk_ids is None:
         topk_ids = torch.empty((m, topk), dtype=torch.int32, device=device)
-    if not fused_supported(m, ne, topk, hidden, inter):
+    if not fused_supported(m, ne, topk, hidden, inter, FUSED_M_MAX):
         res = _reference(logits, bias, x, w1, w2, w1_scale, w2_scale, topk,
                          topk_weights, topk_ids, situ_beta, situ_linear_beta)
         return res if out is None else out.copy_(res)

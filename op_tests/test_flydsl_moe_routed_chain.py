@@ -156,7 +156,7 @@ def main():
     rows = []
     for pool in a.pool:
         for m in a.m:
-            assert m <= FUSED_M_MAX and fused_supported(m, a.e, a.k, a.hidden, a.inter), m
+            assert fused_supported(m, a.e, a.k, a.hidden, a.inter, FUSED_M_MAX), m
             rows.append(test_routed_chain(m, a.e, a.k, a.hidden, a.inter, pool, weights))
     print(pd.DataFrame(rows).to_string(index=False))
 
