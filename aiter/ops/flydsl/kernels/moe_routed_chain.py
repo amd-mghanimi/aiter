@@ -86,6 +86,10 @@ def _popc(x):
     return fx.Int32(fmath.ctpop(fx.Int32(x).ir_value()))
 
 
+def _popc64(x):
+    return fx.Int64(fmath.ctpop(fx.Int64(x).ir_value())).to(fx.Int32)
+
+
 def _lds_or(addr_i64, val):
     """Workgroup-scope LDS fetch-and-or at a raw LDS byte address."""
     _llvm.AtomicRMWOp(
@@ -295,7 +299,8 @@ def _topk_token(
     TRACE,
     WT,
     PIVOT_BALLOT,
-    RANK_WAVE,
+    RANK_SPLIT,
+    CAND_BALLOT,
     L_LM,
     L_PIV,
     L_WTOT,
@@ -350,6 +355,12 @@ def _topk_token(
         ids.append(e)
         sig.append(s)
         choice.append(ok.select(s + fx.Float32(bias[ec]), neg_inf))
+    if const_expr(RANK_SPLIT):
+        # Candidate slots past n_cand read as losers: ordered before the
+        # compaction writes by the pivot barrier.
+        if tid < fx.Int32(WAVE):
+            s_cv[tid] = neg_inf
+            s_ci[tid] = fx.Int32(0x7FFFFFFF)
     tmark(3)
 
     # Pivot: the largest over waves of each wave's TOPK-th largest lane
@@ -377,46 +388,63 @@ def _topk_token(
 
     tmark(4)
     hits = [choice[j] >= pv for j in range_constexpr(EPL)]
-    c_l = fx.Int32(0)
-    for j in range_constexpr(EPL):
-        c_l = c_l + hits[j].select(fx.Int32(1), fx.Int32(0))
-    pos, n_cand = _block_excl_scan(c_l, lane, wave, wtot)
-    for j in range_constexpr(EPL):
-        if hits[j]:
-            s_cv[pos] = choice[j]
-            s_ci[pos] = ids[j]
-            s_cs[pos] = sig[j]
-        pos = pos + hits[j].select(fx.Int32(1), fx.Int32(0))
+    if const_expr(CAND_BALLOT):
+        # Slot of each hit: earlier hits of the wave (j-major, then lane) by
+        # ballot + popcount, plus the hits of lower waves.
+        lt = (fx.Int64(1) << fx.Int64(lane)) - fx.Int64(1)
+        run = fx.Int32(0)
+        slots = []
+        for j in range_constexpr(EPL):
+            mask = fx.Int64(rocdl.ballot(T.i64, hits[j]))
+            slots.append(run + _popc64(mask & lt))
+            run = run + _popc64(mask)
+        if lane == fx.Int32(0):
+            wtot[wave] = run
+        gpu.barrier()
+        wbase = fx.Int32(0)
+        n_cand = fx.Int32(0)
+        for wv in range_constexpr(N_WAVES):
+            t = fx.Int32(wtot[fx.Int32(wv)])
+            wbase = wbase + (fx.Int32(wv) < wave).select(t, fx.Int32(0))
+            n_cand = n_cand + t
+        for j in range_constexpr(EPL):
+            if hits[j]:
+                s_cv[wbase + slots[j]] = choice[j]
+                s_ci[wbase + slots[j]] = ids[j]
+                s_cs[wbase + slots[j]] = sig[j]
+    else:
+        c_l = fx.Int32(0)
+        for j in range_constexpr(EPL):
+            c_l = c_l + hits[j].select(fx.Int32(1), fx.Int32(0))
+        pos, n_cand = _block_excl_scan(c_l, lane, wave, wtot)
+        for j in range_constexpr(EPL):
+            if hits[j]:
+                s_cv[pos] = choice[j]
+                s_ci[pos] = ids[j]
+                s_cs[pos] = sig[j]
+            pos = pos + hits[j].select(fx.Int32(1), fx.Int32(0))
     gpu.barrier()
     tmark(5)
 
     ti = global_typed_ptr(arg_ti, T.i32)
     tw = global_typed_ptr(arg_tw, T.f32)
-    if const_expr(RANK_WAVE):
-        # Up to one candidate per lane of wave 0: rank against readlane
-        # broadcasts in registers and normalize in-wave.
+    if const_expr(RANK_SPLIT):
+        # Up to WAVE candidates: lane c of every wave counts the candidates
+        # that beat c among the wave's WAVE / N_WAVES (broadcast LDS reads);
+        # wave 0 sums the partial ranks after the barrier.
+        QPW = WAVE // N_WAVES
+        s_part = _lds_i32(lds_base, L_LM)
         fast = n_cand <= fx.Int32(WAVE)
         if fast:
-            if wave == fx.Int32(0):
-                ok = lane < n_cand
-                lc = ok.select(lane, fx.Int32(0))
-                mk = ok.select(_order_key(fx.Float32(s_cv[lc])), fx.Int32(-(1 << 31)))
-                mi = ok.select(fx.Int32(s_ci[lc]), fx.Int32(0x7FFFFFFF))
-                ms = fx.Float32(s_cs[lc])
-                rank = fx.Int32(0)
-                for q in range_constexpr(WAVE):
-                    ok_q = fx.Int32(rocdl.readlane(T.i32, mk, q))
-                    oi_q = fx.Int32(rocdl.readlane(T.i32, mi, q))
-                    beats = (ok_q > mk) | ((ok_q == mk) & (oi_q < mi))
-                    rank = rank + beats.select(fx.Int32(1), fx.Int32(0))
-                sel = ok & (rank < fx.Int32(TOPK))
-                sv = sel.select(ms, fx.Float32(0.0))
-                tot = sv
-                for sh in range_constexpr(6):
-                    tot = tot + tot.shuffle_xor(fx.Int32(1 << sh), fx.Int32(WAVE))
-                if sel:
-                    _store(WT, arg_ti, ti, tok * fx.Int32(TOPK) + rank, mi, 4)
-                    _store(WT, arg_tw, tw, tok * fx.Int32(TOPK) + rank, sv / tot, 4)
+            mv = fx.Float32(s_cv[lane])
+            mi = fx.Int32(s_ci[lane])
+            part = fx.Int32(0)
+            for j in range_constexpr(QPW):
+                ov = fx.Float32(s_cv[wave * fx.Int32(QPW) + fx.Int32(j)])
+                oi = fx.Int32(s_ci[wave * fx.Int32(QPW) + fx.Int32(j)])
+                beats = (ov > mv) | ((ov == mv) & (oi < mi))
+                part = part + beats.select(fx.Int32(1), fx.Int32(0))
+            s_part[tid] = part
         n_slow = fast.select(fx.Int32(0), n_cand)
     else:
         n_slow = n_cand
@@ -435,8 +463,20 @@ def _topk_token(
     gpu.barrier()
     tmark(6)
     w_on = wave == fx.Int32(0)
-    if const_expr(RANK_WAVE):
+    if const_expr(RANK_SPLIT):
         w_on = w_on & (n_slow != fx.Int32(0))
+        if fast & (wave == fx.Int32(0)):
+            rank = fx.Int32(s_part[lane])
+            for wv in range_constexpr(1, N_WAVES):
+                rank = rank + fx.Int32(s_part[lane + fx.Int32(wv * WAVE)])
+            sel = (lane < n_cand) & (rank < fx.Int32(TOPK))
+            sv = sel.select(fx.Float32(s_cs[lane]), fx.Float32(0.0))
+            tot = sv
+            for sh in range_constexpr(6):
+                tot = tot + tot.shuffle_xor(fx.Int32(1 << sh), fx.Int32(WAVE))
+            if sel:
+                _store(WT, arg_ti, ti, tok * fx.Int32(TOPK) + rank, fx.Int32(s_ci[lane]), 4)
+                _store(WT, arg_tw, tw, tok * fx.Int32(TOPK) + rank, sv / tot, 4)
     if w_on:
         mine = lane < fx.Int32(TOPK)
         sv = mine.select(fx.Float32(s_sel[lane & fx.Int32(TOPK - 1)]), fx.Float32(0.0))
@@ -593,15 +633,16 @@ def _sort_routes_distinct(
     An expert has at most M_MAX routes (one per token). Bitmap k marks the
     experts with more than k * BM routes, so an expert's first m-block is the
     number of set bits below it over all bitmaps: a scan over NE / 32 words
-    that every wave does on its own.
+    that every wave does on its own, by ballots over the bits of the
+    per-word counts.
     """
     CNT_WORDS = (NE + THREADS - 1) // THREADS * THREADS
     EPT = CNT_WORDS // THREADS
     RPT = (M_MAX * TOPK + THREADS - 1) // THREADS
     NMAP = (M_MAX + BM - 1) // BM
     BW = (NE + 31) // 32
-    SCAN_STEPS = (BW - 1).bit_length()
-    assert BW <= WAVE and NMAP * BW <= THREADS
+    PC_BITS = (32 * NMAP).bit_length()
+    assert BW <= WAVE and NMAP * BW <= THREADS and THREADS <= CNT_WORDS
     cnt = _lds_i32(lds_base, L_CNT)
     bmap = _lds_i32(lds_base, L_BMAP)
     bfill = _lds_i32(lds_base, L_BFILL)
@@ -630,10 +671,12 @@ def _sort_routes_distinct(
         e = fx.Int32(ti[rc])
         es.append(e)
         ws.append(fx.Float32(tw[rc]))
+        # Lanes without a route add 0 to a word of their own (not yet used
+        # fill words): one shared word would serialise their atomics.
+        slot_w = has.select(fx.Int32(L_CNT) + e, fx.Int32(L_BFILL) + tid)
         old = fx.Int32(
             comm_ops.atomic_add_lds(
-                lds_i64 + fx.Int64(L_CNT * 4) + fx.Int64(e) * fx.Int64(4),
-                has.select(fx.Int32(1), fx.Int32(0)),
+                lds_i64 + fx.Int64(slot_w) * fx.Int64(4), has.select(fx.Int32(1), fx.Int32(0)),
             )
         )
         olds.append(old)
@@ -650,12 +693,11 @@ def _sort_routes_distinct(
     for m in range_constexpr(NMAP):
         pc = pc + _popc(bmap[lwc + fx.Int32(m * BW)])
     pc = lw.select(pc, fx.Int32(0))
-    incl = pc
-    for sh in range_constexpr(SCAN_STEPS):
-        o = fx.Int32(gpu.shuffle_up(incl, 1 << sh, WAVE))
-        incl = (lane >= fx.Int32(1 << sh)).select(incl + o, incl)
-    excl = incl - pc
-    total = fx.Int32(rocdl.readlane(T.i32, incl, BW - 1))
+    pc_bits = [fx.Int64(rocdl.ballot(T.i64, ((pc >> fx.Int32(b)) & fx.Int32(1)) != fx.Int32(0)))
+               for b in range_constexpr(PC_BITS)]
+    total = fx.Int32(0)
+    for b in range_constexpr(PC_BITS):
+        total = total + (_popc64(pc_bits[b]) << fx.Int32(b))
 
     stids = global_typed_ptr(arg_stids, T.i32)
     sw = global_typed_ptr(arg_sw, T.f32)
@@ -667,7 +709,10 @@ def _sort_routes_distinct(
         old = olds[k]
         w5 = e >> fx.Int32(5)
         below = (fx.Int32(1) << (e & fx.Int32(31))) - fx.Int32(1)
-        base = fx.Int32(gpu.shuffle_idx(excl, w5, WAVE))
+        lt_w = (fx.Int64(1) << fx.Int64(w5)) - fx.Int64(1)
+        base = fx.Int32(0)
+        for b in range_constexpr(PC_BITS):
+            base = base + (_popc64(pc_bits[b] & lt_w) << fx.Int32(b))
         for m in range_constexpr(NMAP):
             base = base + _popc(fx.Int32(bmap[w5 + fx.Int32(m * BW)]) & below)
         if r < n_routes:
@@ -731,8 +776,9 @@ def compile_routed_chain(
     G1_KSTAGES=0,
     G1_BN_WIDE=0,
     G1_WIDE_MB=96,
-    RANK_WAVE=False,
     SORT_DISTINCT=False,
+    RANK_SPLIT=False,
+    CAND_BALLOT=False,
 ):
     """Compile the fused chain; returns the launcher.
 
@@ -770,8 +816,8 @@ def compile_routed_chain(
     route_lds_words = L_TICKET + 8
 
     topk_kw = dict(
-        NE=NE, TOPK=TOPK, D_HIDDEN=D_HIDDEN, TRACE=TRACE, WT=WT_ROUTE, PIVOT_BALLOT=PIVOT_BALLOT, RANK_WAVE=RANK_WAVE,
-        L_LM=L_LM, L_PIV=L_PIV, L_WTOT=L_WTOT, L_CV=L_CV, L_CI=L_CI, L_CS=L_CS, L_SEL=L_SEL,
+        NE=NE, TOPK=TOPK, D_HIDDEN=D_HIDDEN, TRACE=TRACE, WT=WT_ROUTE, PIVOT_BALLOT=PIVOT_BALLOT, RANK_SPLIT=RANK_SPLIT,
+        CAND_BALLOT=CAND_BALLOT, L_LM=L_LM, L_PIV=L_PIV, L_WTOT=L_WTOT, L_CV=L_CV, L_CI=L_CI, L_CS=L_CS, L_SEL=L_SEL,
     )
     if SORT_DISTINCT:
         # Bitmaps in the b2e words, per-m-block fill in the blk words.
@@ -802,7 +848,7 @@ def compile_routed_chain(
         f"_g1bn{G1_BN}{'_hpf' if G1_PREFETCH_HIDDEN else ''}_g2bn{G2_BN}{'_nt' if G2_USE_NT else ''}"
         f"{'_trace' if TRACE else ''}{'_routeonly' if ROUTE_ONLY else ''}"
     f"{'_g1only' if GEMM1_ONLY else ''}{f'_empty{EMPTY}' if EMPTY else ''}{'_wtr' if WT_ROUTE else ''}{'_1l' if ONE_LANE else ''}{'_aql1' if ACQ_ROUTE_L1 else ''}{'_pvb' if PIVOT_BALLOT else ''}{f'_pad{LDS_PAD}' if LDS_PAD else ''}{'_aqm1' if ACQ_MBLOCK_L1 else ''}{'_wti' if WT_INTER else ''}{f'_spin{SPIN}' if SPIN != SPIN_SLEEP else ''}{'_cpad' if CTRL_PAD else ''}{'_nodone' if NO_DONE else ''}{'_w2pf' if G2_PREFETCH else ''}{f'_ks{G1_KSTAGES}' if G1_KSTAGES else ''}{f'_g1w{G1_BN_WIDE}t{G1_WIDE_MB}' if G1_BN_WIDE else ''}"
-        f"{'_rkw' if RANK_WAVE else ''}{'_sdist' if SORT_DISTINCT else ''}"
+        f"{'_sdist' if SORT_DISTINCT else ''}{'_rks' if RANK_SPLIT else ''}{'_cbal' if CAND_BALLOT else ''}"
     )
 
     # FlyDSL keys its compile cache on sources and scalar closure values; the
