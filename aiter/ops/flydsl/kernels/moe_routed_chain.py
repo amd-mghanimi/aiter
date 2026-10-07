@@ -83,11 +83,17 @@ def _rcp(x):
 
 
 @comm_ops.traced
-def _spin_ge(addr_i64, val, sleep):
+def _spin_ge(addr_i64, val, sleep, eq=False):
+    """Spin until the word reaches val (eq: equals val)."""
     cur = fx.Int32(comm_ops.load_i32_global_agent(addr_i64))
-    while cur < fx.Int32(val):
-        rocdl.s_sleep(sleep)
-        cur = fx.Int32(comm_ops.load_i32_global_agent(addr_i64))
+    if const_expr(eq):
+        while cur != fx.Int32(val):
+            rocdl.s_sleep(sleep)
+            cur = fx.Int32(comm_ops.load_i32_global_agent(addr_i64))
+    else:
+        while cur < fx.Int32(val):
+            rocdl.s_sleep(sleep)
+            cur = fx.Int32(comm_ops.load_i32_global_agent(addr_i64))
     return cur
 
 
@@ -171,6 +177,18 @@ def _bump(wave, lane, addr, one=False, release=True):
         _ctl_add(lane, addr, one)
 
 
+@comm_ops.traced
+def _raise(wave, addr, val, release=True):
+    """Release (fence, or drain write-through stores), then store val to a control word."""
+    if const_expr(not release):
+        rocdl.s_waitcnt(vmcnt=0)
+    gpu.barrier()
+    if wave == fx.Int32(0):
+        if const_expr(release):
+            comm_ops.fence_agent_release()
+        _st_wt(addr, fx.Int32(0), fx.Int32(val), 4)
+
+
 def _st_wt(base_i64, index, val, nbytes):
     """Device-scope store: writes through the XCD's L2, so no L2 writeback is needed."""
     _llvm.StoreOp(
@@ -187,7 +205,7 @@ def _store(wt, base_i64, ptr, index, val, nbytes):
 
 
 @comm_ops.traced
-def _wait_ge(wave, addr, val, l1_only=False, sleep=SPIN_SLEEP):
+def _wait_ge(wave, addr, val, l1_only=False, sleep=SPIN_SLEEP, eq=False):
     """Spin until a control word reaches val, then acquire.
 
     l1_only drops only this CU's L1. That is enough when everything the word
@@ -195,7 +213,7 @@ def _wait_ge(wave, addr, val, l1_only=False, sleep=SPIN_SLEEP):
     this launch read those lines earlier: the dispatch already invalidated L2.
     """
     if wave == fx.Int32(0):
-        _spin_ge(addr, val, sleep)
+        _spin_ge(addr, val, sleep, eq)
         if const_expr(l1_only):
             rocdl.s_waitcnt(vmcnt=0)
             _llvm.InlineAsmOp(None, [], "buffer_inv sc0", "", has_side_effects=True)
@@ -528,6 +546,7 @@ def compile_routed_chain(
     WT_INTER=True,
     SPIN=SPIN_SLEEP,
     CTRL_PAD=True,
+    NO_DONE=True,
 ):
     """Compile the fused chain; returns the launcher.
 
@@ -577,7 +596,7 @@ def compile_routed_chain(
         f"moe_routed_chain_m{M_MAX}_ne{NE}_k{TOPK}_h{D_HIDDEN}_i{D_INTER}"
         f"_g1bn{G1_BN}{'_hpf' if G1_PREFETCH_HIDDEN else ''}_g2bn{G2_BN}{'_nt' if G2_USE_NT else ''}"
         f"{'_trace' if TRACE else ''}{'_routeonly' if ROUTE_ONLY else ''}"
-    f"{'_g1only' if GEMM1_ONLY else ''}{'_empty' if EMPTY else ''}{'_wtr' if WT_ROUTE else ''}{'_1l' if ONE_LANE else ''}{'_aql1' if ACQ_ROUTE_L1 else ''}{'_pvb' if PIVOT_BALLOT else ''}{f'_pad{LDS_PAD}' if LDS_PAD else ''}{'_aqm1' if ACQ_MBLOCK_L1 else ''}{'_wti' if WT_INTER else ''}{f'_spin{SPIN}' if SPIN != SPIN_SLEEP else ''}{'_cpad' if CTRL_PAD else ''}"
+    f"{'_g1only' if GEMM1_ONLY else ''}{'_empty' if EMPTY else ''}{'_wtr' if WT_ROUTE else ''}{'_1l' if ONE_LANE else ''}{'_aql1' if ACQ_ROUTE_L1 else ''}{'_pvb' if PIVOT_BALLOT else ''}{f'_pad{LDS_PAD}' if LDS_PAD else ''}{'_aqm1' if ACQ_MBLOCK_L1 else ''}{'_wti' if WT_INTER else ''}{f'_spin{SPIN}' if SPIN != SPIN_SLEEP else ''}{'_cpad' if CTRL_PAD else ''}{'_nodone' if NO_DONE else ''}"
     )
 
     # FlyDSL keys its compile cache on sources and scalar closure values; the
@@ -655,6 +674,14 @@ def compile_routed_chain(
                     _route_mark(tid, arg_trace, k)
 
             mb_max = i32_M * fx.Int32(TOPK)
+            # NO_DONE: the done word holds a launch epoch (mod 2^30). The routed flag
+            # is never reset: this launch stores epoch + 1 into it and waiters wait for
+            # equality, so the epoch can wrap. It is read before the first grab, so it
+            # cannot move under us (the last grab moves it).
+            routed_at = fx.Int32(1)
+            if const_expr(NO_DONE and not EMPTY):
+                epoch = rocdl.readfirstlane(T.i32, fx.Int32(comm_ops.load_i32_global_agent(a_done)))
+                routed_at = (epoch + fx.Int32(1)) & fx.Int32((1 << 30) - 1)
             if const_expr(not EMPTY):
                 t = _grab(wave, lane, lds_base, a_ticket, L_TICKET + 3, ONE_LANE)
 
@@ -679,12 +706,15 @@ def compile_routed_chain(
                         )
                         rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
                         rmark(12)
-                        _bump(wave, lane, a_routed, ONE_LANE, not WT_ROUTE)
+                        if const_expr(NO_DONE):
+                            _raise(wave, a_routed, routed_at, not WT_ROUTE)
+                        else:
+                            _bump(wave, lane, a_routed, ONE_LANE, not WT_ROUTE)
                         rmark(1)
                     mark(t, 2)
                     t = _grab(wave, lane, lds_base, a_ticket, L_TICKET + 4, ONE_LANE)
 
-                _wait_ge(wave, a_routed, fx.Int32(1), ACQ_ROUTE_L1 and WT_ROUTE, SPIN)
+                _wait_ge(wave, a_routed, routed_at, ACQ_ROUTE_L1 and WT_ROUTE, SPIN, NO_DONE)
                 total_mb = fx.Int32(global_typed_ptr(arg_cumsum, T.i32)[0]) // fx.Int32(BM)
                 n_g1 = total_mb * fx.Int32(NNB1)
                 n_work = i32_M + n_g1 + total_mb * fx.Int32(NNB2)
@@ -723,18 +753,32 @@ def compile_routed_chain(
                             mark(t, 2)
                         t = _grab(wave, lane, lds_base, a_ticket, L_TICKET + 5, ONE_LANE)
 
-            # Last workgroup out resets the control words for the next launch.
-            rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
-            n_done = _count(wave, lane, lds_base, a_done, L_TICKET + 2, ONE_LANE)
-            if n_done == i32_grid - fx.Int32(1):
-                ctrl32 = global_typed_ptr(arg_ctrl, T.i32)
-                for i in range(tid, mb_max, fx.Int32(THREADS)):
-                    ctrl32[fx.Int32(W_MBLOCK) + i * fx.Int32(MB_STRIDE)] = fx.Int32(0)
-                if tid == fx.Int32(0):
-                    ctrl32[W_TICKET] = fx.Int32(0)
-                    ctrl32[W_ROUTED] = fx.Int32(0)
-                    ctrl32[W_DONE] = fx.Int32(0)
-                    ctrl32[W_TOPK] = fx.Int32(0)
+            if const_expr(NO_DONE and not EMPTY):
+                # Every workgroup ends holding exactly one ticket >= n_work, taken after
+                # its last item. The holder of the largest one is the last workgroup to
+                # use the ticket, top-k and m-block words; others only still read the
+                # routed flag, which is not reset.
+                if t == n_work + i32_grid - fx.Int32(1):
+                    ctrl32 = global_typed_ptr(arg_ctrl, T.i32)
+                    for i in range(tid, mb_max, fx.Int32(THREADS)):
+                        ctrl32[fx.Int32(W_MBLOCK) + i * fx.Int32(MB_STRIDE)] = fx.Int32(0)
+                    if tid == fx.Int32(0):
+                        ctrl32[W_TICKET] = fx.Int32(0)
+                        ctrl32[W_TOPK] = fx.Int32(0)
+                        ctrl32[W_DONE] = routed_at
+            else:
+                # Last workgroup out resets the control words for the next launch.
+                rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
+                n_done = _count(wave, lane, lds_base, a_done, L_TICKET + 2, ONE_LANE)
+                if n_done == i32_grid - fx.Int32(1):
+                    ctrl32 = global_typed_ptr(arg_ctrl, T.i32)
+                    for i in range(tid, mb_max, fx.Int32(THREADS)):
+                        ctrl32[fx.Int32(W_MBLOCK) + i * fx.Int32(MB_STRIDE)] = fx.Int32(0)
+                    if tid == fx.Int32(0):
+                        ctrl32[W_TICKET] = fx.Int32(0)
+                        ctrl32[W_ROUTED] = fx.Int32(0)
+                        ctrl32[W_DONE] = fx.Int32(0)
+                        ctrl32[W_TOPK] = fx.Int32(0)
 
         @flyc.jit
         def launch_routed_chain(
