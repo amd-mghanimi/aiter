@@ -8,6 +8,9 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
 from ..mxfp4_kname import MXFP4_G1_VARIANTS
+from flydsl._mlir.dialects import llvm as _llvm
+
+from . import communication_ops_utils as comm_ops
 from . import dpp_utils
 from .mxfp4_gemm_common import (
     _activation_mul_batch,
@@ -54,6 +57,18 @@ def gemm1_grid(n_tokens, BM, *, NE, TOPK, INTER, BN=256):
     return max_m_blocks * num_n_blocks
 
 
+def _out_store(wt, tiles, base_i64, idx, value, numeric_cls):
+    """Epilogue store; ``wt`` makes it device scope so it writes through the XCD's L2."""
+    if const_expr(wt):
+        nbytes = numeric_cls.width // 8
+        _llvm.StoreOp(
+            numeric_cls(value).ir_value(), comm_ops._ptr_plus(base_i64, idx, nbytes), alignment=nbytes,
+            ordering=_llvm.AtomicOrdering.monotonic, syncscope=fx.rocdl.SyncScope.AgentOneAs,
+        )
+    else:
+        _scalar_store(tiles, idx, value, numeric_cls)
+
+
 @flyc.jit
 def _gemm1_body(
     lds_raw_ptr,
@@ -95,6 +110,7 @@ def _gemm1_body(
     k_wave=1,
     epi_splits=1,
     k_stages=kStages,
+    wt_out=False,
 ):
     # A-code tile bytes/row: fp4 packs 2 codes/byte (BK/2); fp8 is 1 B/elem (BK).
     KH_TILE = BK if a_dtype == "fp8" else BK // 2
@@ -1197,14 +1213,18 @@ def _gemm1_body(
                     + kk * fx.Int32(8)
                 )
                 store_off = _layout_idx(aqout_layout, payload_row, byte_pos)
-                _scalar_store(
+                _out_store(
+                    wt_out,
                     aqout_tiles,
+                    arg_aqout,
                     store_off // fx.Int32(4),
                     packed0,
                     fx.Int32,
                 )
-                _scalar_store(
+                _out_store(
+                    wt_out,
                     aqout_tiles,
+                    arg_aqout,
                     (store_off + fx.Int32(4)) // fx.Int32(4),
                     packed1,
                     fx.Int32,
@@ -1216,8 +1236,10 @@ def _gemm1_body(
                     + kk * fx.Int32(4)
                 )
                 store_off = _layout_idx(aqout_layout, payload_row, byte_pos)
-                _scalar_store(
+                _out_store(
+                    wt_out,
                     aqout_tiles,
+                    arg_aqout,
                     store_off // fx.Int32(4),
                     packed0,
                     fx.Int32,
@@ -1377,8 +1399,10 @@ def _gemm1_body(
                     )
                     # ikxdl selects one of the two disjoint 16-bit halves of
                     # the dword, so a narrow store replaces the atomic merge.
-                    _scalar_store(
+                    _out_store(
+                        wt_out,
                         ascaleout_i16_tiles,
+                        arg_ascaleout,
                         dword_off * fx.Int32(2) + ikxdl,
                         duplicated_scale,
                         fx.Int16,
@@ -1392,8 +1416,10 @@ def _gemm1_body(
                         ascaleout_layout, chunk, ku, scale_wave_grp, m_lane
                     )
                     byte_pos = ikxdl * fx.Int32(2) + row_half
-                    _scalar_store(
+                    _out_store(
+                        wt_out,
                         ascaleout_i8_tiles,
+                        arg_ascaleout,
                         dword_off * fx.Int32(4) + byte_pos,
                         scales_per_mr[0],
                         fx.Int8,
@@ -1406,8 +1432,10 @@ def _gemm1_body(
                     ascaleout_layout, chunk, ku, scale_wave_grp, row_in_16
                 )
                 byte_pos = ikxdl * fx.Int32(2) + row_half
-                _scalar_store(
+                _out_store(
+                    wt_out,
                     ascaleout_i8_tiles,
+                    arg_ascaleout,
                     dword_off * fx.Int32(4) + byte_pos,
                     scales_per_mr[0],
                     fx.Int8,
@@ -1422,8 +1450,10 @@ def _gemm1_body(
                         scales_per_mr[sub * 2 + 1] << fx.Int32(8)
                     )
                     addr = dword_off * fx.Int32(4) + ikxdl * fx.Int32(2)
-                    _scalar_store(
+                    _out_store(
+                        wt_out,
                         ascaleout_i16_tiles,
+                        arg_ascaleout,
                         addr // fx.Int32(2),
                         pair_i32,
                         fx.Int16,

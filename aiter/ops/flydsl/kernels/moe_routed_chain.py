@@ -27,6 +27,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr, rocdl
+from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
 from . import communication_ops_utils as comm_ops
@@ -201,6 +202,28 @@ def _wait_ge(wave, addr, val, l1_only=False):
     gpu.barrier()
 
 
+def _order_key(x):
+    """i32 whose signed order is the order of the (non-NaN) f32 ``x``."""
+    b = fx.Float32(x).bitcast(fx.Int32)
+    return (b < fx.Int32(0)).select(b ^ fx.Int32(0x7FFFFFFF), b)
+
+
+def _key_value(k):
+    return ((k < fx.Int32(0)).select(k ^ fx.Int32(0x7FFFFFFF), k)).bitcast(fx.Float32)
+
+
+def _wave_kth_key(key, k):
+    """Largest t with at least k lanes of the wave holding key >= t, by bisection on ballots."""
+    def n_ge(t):
+        return fx.Int64(fmath.ctpop(fx.Int64(rocdl.ballot(T.i64, key >= t)).ir_value()))
+
+    t = (n_ge(fx.Int32(0)) >= fx.Int64(k)).select(fx.Int32(0), fx.Int32(-(1 << 31)))
+    for b in range_constexpr(30, -1, -1):
+        c = t | fx.Int32(1 << b)
+        t = (n_ge(c) >= fx.Int64(k)).select(c, t)
+    return t
+
+
 @comm_ops.traced
 def _block_excl_scan(v, lane, wave, wtot):
     """Exclusive prefix and total of one i32 per thread across the workgroup."""
@@ -239,6 +262,7 @@ def _topk_token(
     D_HIDDEN,
     TRACE,
     WT,
+    PIVOT_BALLOT,
     L_LM,
     L_PIV,
     L_WTOT,
@@ -300,14 +324,19 @@ def _topk_token(
     lmax = choice[0]
     for j in range_constexpr(1, EPL):
         lmax = lmax.maximumf(choice[j])
-    s_lm[tid] = lmax
-    lrank = fx.Int32(0)
-    for q in range_constexpr(WAVE):
-        o = fx.Float32(s_lm[wave * fx.Int32(WAVE) + fx.Int32(q)])
-        beats = (o > lmax) | ((o == lmax) & (fx.Int32(q) < lane))
-        lrank = lrank + beats.select(fx.Int32(1), fx.Int32(0))
-    if lrank == fx.Int32(TOPK - 1):
-        s_piv[wave] = lmax
+    if const_expr(PIVOT_BALLOT):
+        wpiv = _key_value(_wave_kth_key(_order_key(lmax), TOPK))
+        if lane == fx.Int32(0):
+            s_piv[wave] = wpiv
+    else:
+        s_lm[tid] = lmax
+        lrank = fx.Int32(0)
+        for q in range_constexpr(WAVE):
+            o = fx.Float32(s_lm[wave * fx.Int32(WAVE) + fx.Int32(q)])
+            beats = (o > lmax) | ((o == lmax) & (fx.Int32(q) < lane))
+            lrank = lrank + beats.select(fx.Int32(1), fx.Int32(0))
+        if lrank == fx.Int32(TOPK - 1):
+            s_piv[wave] = lmax
     gpu.barrier()
     pv = fx.Float32(s_piv[0])
     for wv in range_constexpr(1, N_WAVES):
@@ -478,7 +507,7 @@ def compile_routed_chain(
     D_HIDDEN=3584,
     D_INTER=384,
     G1_BN=256,
-    G1_PREFETCH_HIDDEN=False,
+    G1_PREFETCH_HIDDEN=True,
     G2_BN=128,
     G2_BK=128,
     G2_USE_NT=False,
@@ -491,6 +520,10 @@ def compile_routed_chain(
     WT_ROUTE=True,
     ONE_LANE=True,
     ACQ_ROUTE_L1=True,
+    PIVOT_BALLOT=True,
+    LDS_PAD=0,
+    ACQ_MBLOCK_L1=True,
+    WT_INTER=True,
 ):
     """Compile the fused chain; returns the launcher.
 
@@ -524,7 +557,7 @@ def compile_routed_chain(
     route_lds_words = L_TICKET + 8
 
     topk_kw = dict(
-        NE=NE, TOPK=TOPK, D_HIDDEN=D_HIDDEN, TRACE=TRACE, WT=WT_ROUTE, L_LM=L_LM, L_PIV=L_PIV, L_WTOT=L_WTOT,
+        NE=NE, TOPK=TOPK, D_HIDDEN=D_HIDDEN, TRACE=TRACE, WT=WT_ROUTE, PIVOT_BALLOT=PIVOT_BALLOT, L_LM=L_LM, L_PIV=L_PIV, L_WTOT=L_WTOT,
         L_CV=L_CV, L_CI=L_CI, L_CS=L_CS, L_SEL=L_SEL,
     )
     sort_kw = dict(NE=NE, TOPK=TOPK, M_MAX=M_MAX, TRACE=TRACE, WT=WT_ROUTE, L_CNT=L_CNT, L_BLK=L_BLK, L_B2E=L_B2E, L_RPOS=L_RPOS,
@@ -534,14 +567,18 @@ def compile_routed_chain(
         a_dtype="fp4", out_dtype="fp4", act="situv2", situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta, swiglu_limit=7.0, enable_bias=False,
         K=D_HIDDEN, N_OUT=N_OUT1, NE=NE, interleave=False, native_scale_layout=True,
-        num_waves=4, k_wave=1, epi_splits=epi_splits, k_stages=k_stages,
+        num_waves=4, k_wave=1, epi_splits=epi_splits, k_stages=k_stages, wt_out=WT_INTER,
     )
     name = (
         f"moe_routed_chain_m{M_MAX}_ne{NE}_k{TOPK}_h{D_HIDDEN}_i{D_INTER}"
         f"_g1bn{G1_BN}{'_hpf' if G1_PREFETCH_HIDDEN else ''}_g2bn{G2_BN}{'_nt' if G2_USE_NT else ''}"
         f"{'_trace' if TRACE else ''}{'_routeonly' if ROUTE_ONLY else ''}"
-    f"{'_g1only' if GEMM1_ONLY else ''}{'_empty' if EMPTY else ''}{'_wtr' if WT_ROUTE else ''}{'_1l' if ONE_LANE else ''}{'_aql1' if ACQ_ROUTE_L1 else ''}"
+    f"{'_g1only' if GEMM1_ONLY else ''}{'_empty' if EMPTY else ''}{'_wtr' if WT_ROUTE else ''}{'_1l' if ONE_LANE else ''}{'_aql1' if ACQ_ROUTE_L1 else ''}{'_pvb' if PIVOT_BALLOT else ''}{f'_pad{LDS_PAD}' if LDS_PAD else ''}{'_aqm1' if ACQ_MBLOCK_L1 else ''}{'_wti' if WT_INTER else ''}"
     )
+
+    # FlyDSL keys its compile cache on sources and scalar closure values; the
+    # knob dicts reach the kernel only through calls, so key on them here.
+    cache_tag = repr((name, sorted(topk_kw.items()), sorted(sort_kw.items()), sorted(g1_kw.items())))
 
     def compose(*, module_name, emit_gemm2_tile, shared_storage):
         @fx.struct
@@ -551,6 +588,10 @@ def compile_routed_chain(
         @fx.struct
         class G1Storage:
             raw: fx.Array[fx.Uint8, g1_lds_bytes, 16]
+
+        @fx.struct
+        class PadStorage:
+            raw: fx.Array[fx.Uint8, max(LDS_PAD, 16), 16]
 
         @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
         def routed_chain_kernel(
@@ -576,6 +617,7 @@ def compile_routed_chain(
             i32_M: fx.Int32,
             i32_grid: fx.Int32,
         ):
+            _ = cache_tag
             tid = fx.Int32(gpu.thread_id("x"))
             lane = tid % fx.Int32(WAVE)
             wave = rocdl.readfirstlane(T.i32, tid // fx.Int32(WAVE))
@@ -583,6 +625,8 @@ def compile_routed_chain(
             route_lds = smem.allocate(RouteStorage).peek().raw.ptr
             g1_lds = smem.allocate(G1Storage).peek().raw.ptr
             g2_lds = smem.allocate(shared_storage).peek()
+            if const_expr(LDS_PAD):
+                smem.allocate(PadStorage)
             lds_base = fx.Int32(ptrtoint(route_lds))
 
             ctrl = fx.Int64(arg_ctrl)
@@ -652,13 +696,13 @@ def compile_routed_chain(
                                 True, i32_M, total_mb, **g1_kw,
                             )
                             rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
-                            _bump(wave, lane, a_mblock + fx.Int64(mb1) * fx.Int64(4), ONE_LANE)
+                            _bump(wave, lane, a_mblock + fx.Int64(mb1) * fx.Int64(4), ONE_LANE, not WT_INTER)
                             mark(t, 2)
                         if wk >= n_g1:
                             u = wk - n_g1
                             mb2 = u // fx.Int32(NNB2)
                             nb2 = u - mb2 * fx.Int32(NNB2)
-                            _wait_ge(wave, a_mblock + fx.Int64(mb2) * fx.Int64(4), fx.Int32(NNB1))
+                            _wait_ge(wave, a_mblock + fx.Int64(mb2) * fx.Int64(4), fx.Int32(NNB1), ACQ_MBLOCK_L1)
                             mark(t, 1)
                             emit_gemm2_tile(
                                 arg_inter, arg_inter_scale, arg_w2, arg_w2s, arg_eids, arg_stids,
