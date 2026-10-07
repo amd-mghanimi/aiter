@@ -23,13 +23,15 @@ from .kernels.moe_routed_chain import BM, compile_routed_chain, ctrl_words, max_
 from .kernels.mxfp4_gemm_common import kas_per_chunk_dw_for
 
 FUSED_M_MAX = 32
+G1_BN = 128
+G2_BN = 256
 
 
 @functools.cache
 def _launcher(m_max, ne, topk, hidden, inter, g1_bn, beta, linear_beta, trace=False,
-              route_only=False):
+              route_only=False, g2_bn=G2_BN):
     return compile_routed_chain(
-        M_MAX=m_max, NE=ne, TOPK=topk, D_HIDDEN=hidden, D_INTER=inter, G1_BN=g1_bn,
+        M_MAX=m_max, NE=ne, TOPK=topk, D_HIDDEN=hidden, D_INTER=inter, G1_BN=g1_bn, G2_BN=g2_bn,
         situ_beta=beta, situ_linear_beta=linear_beta, TRACE=trace, ROUTE_ONLY=route_only,
     )
 
@@ -136,7 +138,7 @@ def routed_chain(
         out = torch.empty((m, hidden), dtype=torch.bfloat16, device=device)
     stream = torch.cuda.current_stream() if stream is None else stream
     m_max = FUSED_M_MAX
-    launch = _launcher(m_max, ne, topk, hidden, inter, 256, float(situ_beta),
+    launch = _launcher(m_max, ne, topk, hidden, inter, G1_BN, float(situ_beta),
                        float(situ_linear_beta), trace is not None, _route_only)
     ws = workspace if workspace is not None else _workspace(device, m_max, topk, inter)
     meta = launch.chain_meta

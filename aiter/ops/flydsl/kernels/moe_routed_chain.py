@@ -407,6 +407,8 @@ def compile_routed_chain(
     situ_linear_beta=25.0,
     TRACE=False,
     ROUTE_ONLY=False,
+    GEMM1_ONLY=False,
+    EMPTY=False,
 ):
     """Compile the fused chain; returns the launcher.
 
@@ -456,6 +458,7 @@ def compile_routed_chain(
         f"moe_routed_chain_m{M_MAX}_ne{NE}_k{TOPK}_h{D_HIDDEN}_i{D_INTER}"
         f"_g1bn{G1_BN}{'_hpf' if G1_PREFETCH_HIDDEN else ''}_g2bn{G2_BN}{'_nt' if G2_USE_NT else ''}"
         f"{'_trace' if TRACE else ''}{'_routeonly' if ROUTE_ONLY else ''}"
+    f"{'_g1only' if GEMM1_ONLY else ''}{'_empty' if EMPTY else ''}"
     )
 
     def compose(*, module_name, emit_gemm2_tile, shared_storage):
@@ -516,66 +519,69 @@ def compile_routed_chain(
                     _route_mark(tid, arg_trace, k)
 
             mb_max = i32_M * fx.Int32(TOPK)
-            t = _grab(wave, lane, lds_base, a_ticket, L_TICKET)
-
-            while t < i32_M:
-                mark(t, 0)
-                _topk_token(
-                    lds_base, arg_logits, arg_bias, arg_tw, arg_ti, arg_out, t, tid, lane,
-                    wave, **topk_kw,
-                )
-                rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
-                n_topk = _count(wave, lane, lds_base, a_topk, L_TICKET + 1)
-                mark(t, 1)
-                if n_topk == i32_M - fx.Int32(1):
-                    _wait_ge(wave, a_topk, i32_M)
-                    rmark(0)
-                    _sort_routes(
-                        lds_base, arg_tw, arg_ti, arg_stids, arg_sw, arg_eids, arg_cumsum,
-                        arg_mind, i32_M, tid, lane, wave, **sort_kw,
-                    )
-                    rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
-                    _bump(wave, lane, a_routed)
-                    rmark(1)
-                mark(t, 2)
+            if const_expr(not EMPTY):
                 t = _grab(wave, lane, lds_base, a_ticket, L_TICKET)
 
-            _wait_ge(wave, a_routed, fx.Int32(1))
-            total_mb = fx.Int32(global_typed_ptr(arg_cumsum, T.i32)[0]) // fx.Int32(BM)
-            n_g1 = total_mb * fx.Int32(NNB1)
-            n_work = i32_M + n_g1 + total_mb * fx.Int32(NNB2)
-            if const_expr(ROUTE_ONLY):
-                n_work = i32_M
-
-            if const_expr(not ROUTE_ONLY):
-                while t < n_work:
+                while t < i32_M:
                     mark(t, 0)
-                    wk = t - i32_M
-                    if wk < n_g1:
-                        mb1 = wk // fx.Int32(NNB1)
-                        mark(t, 1)
-                        _gemm1_body(
-                            g1_lds, arg_x, arg_x, arg_w1, arg_w1s, arg_eids, arg_mind,
-                            arg_inter, arg_inter_scale, arg_x, fx.Int64(0), wk, lane, wave,
-                            True, i32_M, total_mb, **g1_kw,
+                    _topk_token(
+                        lds_base, arg_logits, arg_bias, arg_tw, arg_ti, arg_out, t, tid, lane,
+                        wave, **topk_kw,
+                    )
+                    rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
+                    n_topk = _count(wave, lane, lds_base, a_topk, L_TICKET + 1)
+                    mark(t, 1)
+                    if n_topk == i32_M - fx.Int32(1):
+                        _wait_ge(wave, a_topk, i32_M)
+                        rmark(0)
+                        _sort_routes(
+                            lds_base, arg_tw, arg_ti, arg_stids, arg_sw, arg_eids, arg_cumsum,
+                            arg_mind, i32_M, tid, lane, wave, **sort_kw,
                         )
                         rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
-                        _bump(wave, lane, a_mblock + fx.Int64(mb1) * fx.Int64(4))
-                        mark(t, 2)
-                    if wk >= n_g1:
-                        u = wk - n_g1
-                        mb2 = u // fx.Int32(NNB2)
-                        nb2 = u - mb2 * fx.Int32(NNB2)
-                        _wait_ge(wave, a_mblock + fx.Int64(mb2) * fx.Int64(4), fx.Int32(NNB1))
-                        mark(t, 1)
-                        emit_gemm2_tile(
-                            arg_inter, arg_inter_scale, arg_w2, arg_w2s, arg_eids, arg_stids,
-                            arg_sw, arg_w2, arg_out, mb2, nb2, lane, wave, i32_M, mb_max,
-                            fx.Int32(D_INTER), fx.Int32(D_HIDDEN), g2_lds,
-                        )
-                        rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
-                        mark(t, 2)
+                        _bump(wave, lane, a_routed)
+                        rmark(1)
+                    mark(t, 2)
                     t = _grab(wave, lane, lds_base, a_ticket, L_TICKET)
+
+                _wait_ge(wave, a_routed, fx.Int32(1))
+                total_mb = fx.Int32(global_typed_ptr(arg_cumsum, T.i32)[0]) // fx.Int32(BM)
+                n_g1 = total_mb * fx.Int32(NNB1)
+                n_work = i32_M + n_g1 + total_mb * fx.Int32(NNB2)
+                if const_expr(ROUTE_ONLY):
+                    n_work = i32_M
+                if const_expr(GEMM1_ONLY):
+                    n_work = i32_M + n_g1
+
+                if const_expr(not ROUTE_ONLY):
+                    while t < n_work:
+                        mark(t, 0)
+                        wk = t - i32_M
+                        if wk < n_g1:
+                            mb1 = wk // fx.Int32(NNB1)
+                            mark(t, 1)
+                            _gemm1_body(
+                                g1_lds, arg_x, arg_x, arg_w1, arg_w1s, arg_eids, arg_mind,
+                                arg_inter, arg_inter_scale, arg_x, fx.Int64(0), wk, lane, wave,
+                                True, i32_M, total_mb, **g1_kw,
+                            )
+                            rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
+                            _bump(wave, lane, a_mblock + fx.Int64(mb1) * fx.Int64(4))
+                            mark(t, 2)
+                        if wk >= n_g1:
+                            u = wk - n_g1
+                            mb2 = u // fx.Int32(NNB2)
+                            nb2 = u - mb2 * fx.Int32(NNB2)
+                            _wait_ge(wave, a_mblock + fx.Int64(mb2) * fx.Int64(4), fx.Int32(NNB1))
+                            mark(t, 1)
+                            emit_gemm2_tile(
+                                arg_inter, arg_inter_scale, arg_w2, arg_w2s, arg_eids, arg_stids,
+                                arg_sw, arg_w2, arg_out, mb2, nb2, lane, wave, i32_M, mb_max,
+                                fx.Int32(D_INTER), fx.Int32(D_HIDDEN), g2_lds,
+                            )
+                            rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
+                            mark(t, 2)
+                        t = _grab(wave, lane, lds_base, a_ticket, L_TICKET)
 
             # Last workgroup out resets the control words for the next launch.
             rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
