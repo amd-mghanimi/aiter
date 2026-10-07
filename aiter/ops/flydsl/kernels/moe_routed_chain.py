@@ -613,7 +613,7 @@ def compile_routed_chain(
         f"moe_routed_chain_m{M_MAX}_ne{NE}_k{TOPK}_h{D_HIDDEN}_i{D_INTER}"
         f"_g1bn{G1_BN}{'_hpf' if G1_PREFETCH_HIDDEN else ''}_g2bn{G2_BN}{'_nt' if G2_USE_NT else ''}"
         f"{'_trace' if TRACE else ''}{'_routeonly' if ROUTE_ONLY else ''}"
-    f"{'_g1only' if GEMM1_ONLY else ''}{'_empty' if EMPTY else ''}{'_wtr' if WT_ROUTE else ''}{'_1l' if ONE_LANE else ''}{'_aql1' if ACQ_ROUTE_L1 else ''}{'_pvb' if PIVOT_BALLOT else ''}{f'_pad{LDS_PAD}' if LDS_PAD else ''}{'_aqm1' if ACQ_MBLOCK_L1 else ''}{'_wti' if WT_INTER else ''}{f'_spin{SPIN}' if SPIN != SPIN_SLEEP else ''}{'_cpad' if CTRL_PAD else ''}{'_nodone' if NO_DONE else ''}{'_w2pf' if G2_PREFETCH else ''}{f'_ks{G1_KSTAGES}' if G1_KSTAGES else ''}{f'_g1w{G1_BN_WIDE}t{G1_WIDE_MB}' if G1_BN_WIDE else ''}"
+    f"{'_g1only' if GEMM1_ONLY else ''}{f'_empty{EMPTY}' if EMPTY else ''}{'_wtr' if WT_ROUTE else ''}{'_1l' if ONE_LANE else ''}{'_aql1' if ACQ_ROUTE_L1 else ''}{'_pvb' if PIVOT_BALLOT else ''}{f'_pad{LDS_PAD}' if LDS_PAD else ''}{'_aqm1' if ACQ_MBLOCK_L1 else ''}{'_wti' if WT_INTER else ''}{f'_spin{SPIN}' if SPIN != SPIN_SLEEP else ''}{'_cpad' if CTRL_PAD else ''}{'_nodone' if NO_DONE else ''}{'_w2pf' if G2_PREFETCH else ''}{f'_ks{G1_KSTAGES}' if G1_KSTAGES else ''}{f'_g1w{G1_BN_WIDE}t{G1_WIDE_MB}' if G1_BN_WIDE else ''}"
     )
 
     # FlyDSL keys its compile cache on sources and scalar closure values; the
@@ -696,9 +696,17 @@ def compile_routed_chain(
             # equality, so the epoch can wrap. It is read before the first grab, so it
             # cannot move under us (the last grab moves it).
             routed_at = fx.Int32(1)
-            if const_expr(NO_DONE and not EMPTY):
+            if const_expr(NO_DONE):
                 epoch = rocdl.readfirstlane(T.i32, fx.Int32(comm_ops.load_i32_global_agent(a_done)))
                 routed_at = (epoch + fx.Int32(1)) & fx.Int32((1 << 30) - 1)
+            if const_expr(EMPTY and NO_DONE):
+                # Launch floor: one failing grab per workgroup and the epoch reset
+                # (EMPTY=2: dispatch only, no atomics).
+                t = fx.Int32(0)
+                n_work = i32_grid
+                if const_expr(EMPTY != 2):
+                    t = _grab(wave, lane, lds_base, a_ticket, L_TICKET + 3, ONE_LANE)
+                    n_work = fx.Int32(0)
             if const_expr(not EMPTY):
                 t = _grab(wave, lane, lds_base, a_ticket, L_TICKET + 3, ONE_LANE)
 
@@ -810,7 +818,7 @@ def compile_routed_chain(
                             mark(t, 2)
                         t = _grab(wave, lane, lds_base, a_ticket, L_TICKET + 5, ONE_LANE)
 
-            if const_expr(NO_DONE and not EMPTY):
+            if const_expr(NO_DONE):
                 # Every workgroup ends holding exactly one ticket >= n_work, taken after
                 # its last item. The holder of the largest one is the last workgroup to
                 # use the ticket, top-k and m-block words; others only still read the
