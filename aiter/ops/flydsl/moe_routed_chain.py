@@ -19,8 +19,7 @@ import torch
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.flydsl.moe_common import DEFAULT_SITUV2_BETA, DEFAULT_SITUV2_LINEAR_BETA
 
-from .kernels.moe_routed_chain import BM, compile_routed_chain, ctrl_words, max_m_blocks
-from .kernels.mxfp4_gemm_common import kas_per_chunk_dw_for
+from .kernels.moe_routed_chain import BM, compile_routed_chain, ctrl_words, max_m_blocks, ws_layout
 
 FUSED_M_MAX = 32
 # Above this M the two-kernel path wins (MI355X: M=32 144 vs 162 us); routed_chain still
@@ -57,17 +56,20 @@ class _Workspace:
 
     def __init__(self, device, m_max, topk, inter):
         max_sorted = m_max * topk * BM
-        chunks = max_sorted // BM
-        i32 = dict(dtype=torch.int32, device=device)
-        self.ctrl = torch.zeros(ctrl_words(m_max, topk), **i32)
-        self.stids = torch.empty(max_sorted, **i32)
-        self.sw = torch.empty(max_sorted, dtype=torch.float32, device=device)
-        self.eids = torch.empty(max_m_blocks(m_max, topk), **i32)
-        self.cumsum = torch.empty(2, **i32)
-        self.mind = torch.empty(max_sorted, **i32)
-        self.inter = torch.empty((max_sorted, inter // 2), dtype=torch.uint8, device=device)
-        scale_bytes = max(max_sorted * 64, chunks * kas_per_chunk_dw_for(inter) * 4)
-        self.inter_scale = torch.empty(scale_bytes, dtype=torch.uint8, device=device)
+        offs, total = ws_layout(m_max, topk, inter)
+        self.buf = torch.zeros(total, dtype=torch.uint8, device=device)
+
+        def view(name, nbytes, dtype):
+            return self.buf[offs[name]:offs[name] + nbytes].view(dtype)
+
+        self.ctrl = view("ctrl", ctrl_words(m_max, topk) * 4, torch.int32)
+        self.stids = view("stids", max_sorted * 4, torch.int32)
+        self.sw = view("sw", max_sorted * 4, torch.float32)
+        self.eids = view("eids", max_m_blocks(m_max, topk) * 4, torch.int32)
+        self.cumsum = view("cumsum", 8, torch.int32)
+        self.mind = view("mind", max_sorted * 4, torch.int32)
+        self.inter = view("inter", max_sorted * (inter // 2), torch.uint8).view(max_sorted, inter // 2)
+        self.inter_scale = self.buf[offs["inter_scale"]:]
 
 
 _WORKSPACES = {}

@@ -37,7 +37,7 @@ from .mxfp4_gemm1 import (
     default_epi_splits,
     default_k_stages,
 )
-from .mxfp4_gemm_common import global_typed_ptr, lds_typed_ptr
+from .mxfp4_gemm_common import global_typed_ptr, kas_per_chunk_dw_for, lds_typed_ptr
 from .mxmoe_dispatcher import compile_gemm2_a4w4_port
 
 BM = 16
@@ -64,6 +64,30 @@ def max_m_blocks(m, topk):
 
 def ctrl_words(m_max, topk):
     return LINE_WORDS * (4 + max_m_blocks(m_max, topk))
+
+
+def ws_layout(m_max, topk, inter):
+    """Byte offsets of the workspace buffers inside one allocation, and its size.
+
+    Every offset is a compile-time constant, so with WS_PACK the kernel reaches all
+    buffers from the control-word pointer and keeps one live address, not eight.
+    """
+    max_sorted = m_max * topk * BM
+    sizes = dict(
+        ctrl=ctrl_words(m_max, topk) * 4,
+        stids=max_sorted * 4,
+        sw=max_sorted * 4,
+        eids=max_m_blocks(m_max, topk) * 4,
+        cumsum=8,
+        mind=max_sorted * 4,
+        inter=max_sorted * (inter // 2),
+        inter_scale=max(max_sorted * 64, max_sorted // BM * kas_per_chunk_dw_for(inter) * 4),
+    )
+    offs, total = {}, 0
+    for k, size in sizes.items():
+        offs[k] = total
+        total += (size + 255) // 256 * 256
+    return offs, total
 
 
 def _lds_i32(base, off_words):
@@ -779,6 +803,7 @@ def compile_routed_chain(
     SORT_DISTINCT=True,
     RANK_SPLIT=True,
     CAND_BALLOT=True,
+    WS_PACK=False,
 ):
     """Compile the fused chain; returns the launcher.
 
@@ -849,7 +874,9 @@ def compile_routed_chain(
         f"{'_trace' if TRACE else ''}{'_routeonly' if ROUTE_ONLY else ''}"
     f"{'_g1only' if GEMM1_ONLY else ''}{f'_empty{EMPTY}' if EMPTY else ''}{'_wtr' if WT_ROUTE else ''}{'_1l' if ONE_LANE else ''}{'_aql1' if ACQ_ROUTE_L1 else ''}{'_pvb' if PIVOT_BALLOT else ''}{f'_pad{LDS_PAD}' if LDS_PAD else ''}{'_aqm1' if ACQ_MBLOCK_L1 else ''}{'_wti' if WT_INTER else ''}{f'_spin{SPIN}' if SPIN != SPIN_SLEEP else ''}{'_cpad' if CTRL_PAD else ''}{'_nodone' if NO_DONE else ''}{'_w2pf' if G2_PREFETCH else ''}{f'_ks{G1_KSTAGES}' if G1_KSTAGES else ''}{f'_g1w{G1_BN_WIDE}t{G1_WIDE_MB}' if G1_BN_WIDE else ''}"
         f"{'_sdist' if SORT_DISTINCT else ''}{'_rks' if RANK_SPLIT else ''}{'_cbal' if CAND_BALLOT else ''}"
+        f"{'_wsp' if WS_PACK else ''}"
     )
+    ws_offs = ws_layout(M_MAX, TOPK, D_INTER)[0]
 
     # FlyDSL keys its compile cache on sources and scalar closure values; the
     # knob dicts reach the kernel only through calls, so key on them here.
@@ -911,6 +938,15 @@ def compile_routed_chain(
             lds_base = fx.Int32(ptrtoint(route_lds))
 
             ctrl = fx.Int64(arg_ctrl)
+            if const_expr(WS_PACK):
+                # The workspace pointer arguments go unused (no kernarg loads).
+                arg_stids = ctrl + fx.Int64(ws_offs["stids"])
+                arg_sw = ctrl + fx.Int64(ws_offs["sw"])
+                arg_eids = ctrl + fx.Int64(ws_offs["eids"])
+                arg_cumsum = ctrl + fx.Int64(ws_offs["cumsum"])
+                arg_mind = ctrl + fx.Int64(ws_offs["mind"])
+                arg_inter = ctrl + fx.Int64(ws_offs["inter"])
+                arg_inter_scale = ctrl + fx.Int64(ws_offs["inter_scale"])
             a_ticket = ctrl + fx.Int64(W_TICKET * 4)
             a_routed = ctrl + fx.Int64(W_ROUTED * 4)
             a_done = ctrl + fx.Int64(W_DONE * 4)
