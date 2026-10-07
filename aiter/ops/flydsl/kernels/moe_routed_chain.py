@@ -82,6 +82,18 @@ def _rcp(x):
     return fx.Float32(_llvm.call_intrinsic(T.f32, "llvm.amdgcn.rcp.f32", [fx.Float32(x).ir_value()], [], []))
 
 
+def _popc(x):
+    return fx.Int32(fmath.ctpop(fx.Int32(x).ir_value()))
+
+
+def _lds_or(addr_i64, val):
+    """Workgroup-scope LDS fetch-and-or at a raw LDS byte address."""
+    _llvm.AtomicRMWOp(
+        _llvm.AtomicBinOp._or, comm_ops._to_ptr_lds(addr_i64), fx.Int32(val).ir_value(),
+        _llvm.AtomicOrdering.monotonic, syncscope="workgroup", alignment=4,
+    )
+
+
 @comm_ops.traced
 def _spin_ge(addr_i64, val, sleep, eq=False):
     """Spin until the word reaches val (eq: equals val)."""
@@ -283,6 +295,7 @@ def _topk_token(
     TRACE,
     WT,
     PIVOT_BALLOT,
+    RANK_WAVE,
     L_LM,
     L_PIV,
     L_WTOT,
@@ -379,7 +392,35 @@ def _topk_token(
 
     ti = global_typed_ptr(arg_ti, T.i32)
     tw = global_typed_ptr(arg_tw, T.f32)
-    for c in range(tid, n_cand, fx.Int32(THREADS)):
+    if const_expr(RANK_WAVE):
+        # Up to one candidate per lane of wave 0: rank against readlane
+        # broadcasts in registers and normalize in-wave.
+        fast = n_cand <= fx.Int32(WAVE)
+        if fast:
+            if wave == fx.Int32(0):
+                ok = lane < n_cand
+                lc = ok.select(lane, fx.Int32(0))
+                mk = ok.select(_order_key(fx.Float32(s_cv[lc])), fx.Int32(-(1 << 31)))
+                mi = ok.select(fx.Int32(s_ci[lc]), fx.Int32(0x7FFFFFFF))
+                ms = fx.Float32(s_cs[lc])
+                rank = fx.Int32(0)
+                for q in range_constexpr(WAVE):
+                    ok_q = fx.Int32(rocdl.readlane(T.i32, mk, q))
+                    oi_q = fx.Int32(rocdl.readlane(T.i32, mi, q))
+                    beats = (ok_q > mk) | ((ok_q == mk) & (oi_q < mi))
+                    rank = rank + beats.select(fx.Int32(1), fx.Int32(0))
+                sel = ok & (rank < fx.Int32(TOPK))
+                sv = sel.select(ms, fx.Float32(0.0))
+                tot = sv
+                for sh in range_constexpr(6):
+                    tot = tot + tot.shuffle_xor(fx.Int32(1 << sh), fx.Int32(WAVE))
+                if sel:
+                    _store(WT, arg_ti, ti, tok * fx.Int32(TOPK) + rank, mi, 4)
+                    _store(WT, arg_tw, tw, tok * fx.Int32(TOPK) + rank, sv / tot, 4)
+        n_slow = fast.select(fx.Int32(0), n_cand)
+    else:
+        n_slow = n_cand
+    for c in range(tid, n_slow, fx.Int32(THREADS)):
         mv = fx.Float32(s_cv[c])
         mi = fx.Int32(s_ci[c])
         rank = fx.Int32(0)
@@ -393,7 +434,10 @@ def _topk_token(
             s_sel[rank] = fx.Float32(s_cs[c])
     gpu.barrier()
     tmark(6)
-    if wave == fx.Int32(0):
+    w_on = wave == fx.Int32(0)
+    if const_expr(RANK_WAVE):
+        w_on = w_on & (n_slow != fx.Int32(0))
+    if w_on:
         mine = lane < fx.Int32(TOPK)
         sv = mine.select(fx.Float32(s_sel[lane & fx.Int32(TOPK - 1)]), fx.Float32(0.0))
         tot = sv
@@ -519,6 +563,142 @@ def _sort_routes(
             _store(WT, arg_sw, sw, rr, fx.Float32(0.0), 4)
 
 
+@flyc.jit
+def _sort_routes_distinct(
+    lds_base,
+    arg_tw,
+    arg_ti,
+    arg_stids,
+    arg_sw,
+    arg_eids,
+    arg_cumsum,
+    arg_mind,
+    i32_M,
+    tid,
+    lane,
+    wave,
+    arg_trace,
+    *,
+    NE,
+    TOPK,
+    M_MAX,
+    TRACE,
+    WT,
+    L_CNT,
+    L_BMAP,
+    L_BFILL,
+):
+    """_sort_routes without a scan over all NE experts; the same layout.
+
+    An expert has at most M_MAX routes (one per token). Bitmap k marks the
+    experts with more than k * BM routes, so an expert's first m-block is the
+    number of set bits below it over all bitmaps: a scan over NE / 32 words
+    that every wave does on its own.
+    """
+    CNT_WORDS = (NE + THREADS - 1) // THREADS * THREADS
+    EPT = CNT_WORDS // THREADS
+    RPT = (M_MAX * TOPK + THREADS - 1) // THREADS
+    NMAP = (M_MAX + BM - 1) // BM
+    BW = (NE + 31) // 32
+    SCAN_STEPS = (BW - 1).bit_length()
+    assert BW <= WAVE and NMAP * BW <= THREADS
+    cnt = _lds_i32(lds_base, L_CNT)
+    bmap = _lds_i32(lds_base, L_BMAP)
+    bfill = _lds_i32(lds_base, L_BFILL)
+
+    def tmark(k):
+        if const_expr(TRACE):
+            rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
+            gpu.barrier()
+            _route_mark(tid, arg_trace, k)
+
+    for i in range_constexpr(EPT):
+        cnt[tid + fx.Int32(i * THREADS)] = fx.Int32(0)
+    if tid < fx.Int32(NMAP * BW):
+        bmap[tid] = fx.Int32(0)
+    gpu.barrier()
+
+    n_routes = i32_M * fx.Int32(TOPK)
+    ti = global_typed_ptr(arg_ti, T.i32)
+    tw = global_typed_ptr(arg_tw, T.f32)
+    lds_i64 = fx.Int64(lds_base)
+    es, ws, olds = [], [], []
+    for k in range_constexpr(RPT):
+        r = tid + fx.Int32(k * THREADS)
+        has = r < n_routes
+        rc = has.select(r, fx.Int32(0))
+        e = fx.Int32(ti[rc])
+        es.append(e)
+        ws.append(fx.Float32(tw[rc]))
+        old = fx.Int32(
+            comm_ops.atomic_add_lds(
+                lds_i64 + fx.Int64(L_CNT * 4) + fx.Int64(e) * fx.Int64(4),
+                has.select(fx.Int32(1), fx.Int32(0)),
+            )
+        )
+        olds.append(old)
+        if has & ((old & fx.Int32(BM - 1)) == fx.Int32(0)):
+            word = (old >> fx.Int32(BM.bit_length() - 1)) * fx.Int32(BW) + (e >> fx.Int32(5))
+            _lds_or(lds_i64 + fx.Int64(L_BMAP * 4) + fx.Int64(word) * fx.Int64(4),
+                    fx.Int32(1) << (e & fx.Int32(31)))
+    gpu.barrier()
+    tmark(10)
+
+    lw = lane < fx.Int32(BW)
+    lwc = lw.select(lane, fx.Int32(0))
+    pc = fx.Int32(0)
+    for m in range_constexpr(NMAP):
+        pc = pc + _popc(bmap[lwc + fx.Int32(m * BW)])
+    pc = lw.select(pc, fx.Int32(0))
+    incl = pc
+    for sh in range_constexpr(SCAN_STEPS):
+        o = fx.Int32(gpu.shuffle_up(incl, 1 << sh, WAVE))
+        incl = (lane >= fx.Int32(1 << sh)).select(incl + o, incl)
+    excl = incl - pc
+    total = fx.Int32(rocdl.readlane(T.i32, incl, BW - 1))
+
+    stids = global_typed_ptr(arg_stids, T.i32)
+    sw = global_typed_ptr(arg_sw, T.f32)
+    mind = global_typed_ptr(arg_mind, T.i32)
+    eids = global_typed_ptr(arg_eids, T.i32)
+    for k in range_constexpr(RPT):
+        r = tid + fx.Int32(k * THREADS)
+        e = es[k]
+        old = olds[k]
+        w5 = e >> fx.Int32(5)
+        below = (fx.Int32(1) << (e & fx.Int32(31))) - fx.Int32(1)
+        base = fx.Int32(gpu.shuffle_idx(excl, w5, WAVE))
+        for m in range_constexpr(NMAP):
+            base = base + _popc(fx.Int32(bmap[w5 + fx.Int32(m * BW)]) & below)
+        if r < n_routes:
+            row = base * fx.Int32(BM) + old
+            tok = r // fx.Int32(TOPK)
+            slot = r - tok * fx.Int32(TOPK)
+            _store(WT, arg_stids, stids, row, tok | (slot << fx.Int32(24)), 4)
+            _store(WT, arg_mind, mind, row, tok, 4)
+            _store(WT, arg_sw, sw, row, ws[k], 4)
+            if old == fx.Int32(0):
+                ce = fx.Int32(cnt[e])
+                for m in range_constexpr(NMAP):
+                    if ce > fx.Int32(m * BM):
+                        _store(WT, arg_eids, eids, base + fx.Int32(m), e, 4)
+                        left = ce - fx.Int32(m * BM)
+                        bfill[base + fx.Int32(m)] = (left < fx.Int32(BM)).select(left, fx.Int32(BM))
+    if tid == fx.Int32(0):
+        cs = global_typed_ptr(arg_cumsum, T.i32)
+        _store(WT, arg_cumsum, cs, fx.Int32(0), total * fx.Int32(BM), 4)
+        _store(WT, arg_cumsum, cs, fx.Int32(1), i32_M, 4)
+    gpu.barrier()
+    tmark(11)
+
+    for rr in range(tid, total * fx.Int32(BM), fx.Int32(THREADS)):
+        b = rr >> fx.Int32(BM.bit_length() - 1)
+        if (rr & fx.Int32(BM - 1)) >= fx.Int32(bfill[b]):
+            _store(WT, arg_stids, stids, rr, i32_M, 4)
+            _store(WT, arg_mind, mind, rr, i32_M, 4)
+            _store(WT, arg_sw, sw, rr, fx.Float32(0.0), 4)
+
+
 def compile_routed_chain(
     *,
     M_MAX=16,
@@ -551,6 +731,8 @@ def compile_routed_chain(
     G1_KSTAGES=0,
     G1_BN_WIDE=0,
     G1_WIDE_MB=96,
+    RANK_WAVE=False,
+    SORT_DISTINCT=False,
 ):
     """Compile the fused chain; returns the launcher.
 
@@ -588,11 +770,17 @@ def compile_routed_chain(
     route_lds_words = L_TICKET + 8
 
     topk_kw = dict(
-        NE=NE, TOPK=TOPK, D_HIDDEN=D_HIDDEN, TRACE=TRACE, WT=WT_ROUTE, PIVOT_BALLOT=PIVOT_BALLOT, L_LM=L_LM, L_PIV=L_PIV, L_WTOT=L_WTOT,
-        L_CV=L_CV, L_CI=L_CI, L_CS=L_CS, L_SEL=L_SEL,
+        NE=NE, TOPK=TOPK, D_HIDDEN=D_HIDDEN, TRACE=TRACE, WT=WT_ROUTE, PIVOT_BALLOT=PIVOT_BALLOT, RANK_WAVE=RANK_WAVE,
+        L_LM=L_LM, L_PIV=L_PIV, L_WTOT=L_WTOT, L_CV=L_CV, L_CI=L_CI, L_CS=L_CS, L_SEL=L_SEL,
     )
-    sort_kw = dict(NE=NE, TOPK=TOPK, M_MAX=M_MAX, TRACE=TRACE, WT=WT_ROUTE, L_CNT=L_CNT, L_BLK=L_BLK, L_B2E=L_B2E, L_RPOS=L_RPOS,
-                   L_WTOT=L_WTOT)
+    if SORT_DISTINCT:
+        # Bitmaps in the b2e words, per-m-block fill in the blk words.
+        assert ((M_MAX + BM - 1) // BM) * ((NE + 31) // 32) <= M_MAX * TOPK
+        sort_kw = dict(NE=NE, TOPK=TOPK, M_MAX=M_MAX, TRACE=TRACE, WT=WT_ROUTE, L_CNT=L_CNT, L_BMAP=L_B2E,
+                       L_BFILL=L_BLK)
+    else:
+        sort_kw = dict(NE=NE, TOPK=TOPK, M_MAX=M_MAX, TRACE=TRACE, WT=WT_ROUTE, L_CNT=L_CNT, L_BLK=L_BLK, L_B2E=L_B2E,
+                       L_RPOS=L_RPOS, L_WTOT=L_WTOT)
     g1_kw = dict(
         BM=BM, BN=G1_BN, BK=G1_BK, inline_quant=True, prefetch_hidden=G1_PREFETCH_HIDDEN,
         a_dtype="fp4", out_dtype="fp4", act="situv2", situ_beta=situ_beta,
@@ -614,6 +802,7 @@ def compile_routed_chain(
         f"_g1bn{G1_BN}{'_hpf' if G1_PREFETCH_HIDDEN else ''}_g2bn{G2_BN}{'_nt' if G2_USE_NT else ''}"
         f"{'_trace' if TRACE else ''}{'_routeonly' if ROUTE_ONLY else ''}"
     f"{'_g1only' if GEMM1_ONLY else ''}{f'_empty{EMPTY}' if EMPTY else ''}{'_wtr' if WT_ROUTE else ''}{'_1l' if ONE_LANE else ''}{'_aql1' if ACQ_ROUTE_L1 else ''}{'_pvb' if PIVOT_BALLOT else ''}{f'_pad{LDS_PAD}' if LDS_PAD else ''}{'_aqm1' if ACQ_MBLOCK_L1 else ''}{'_wti' if WT_INTER else ''}{f'_spin{SPIN}' if SPIN != SPIN_SLEEP else ''}{'_cpad' if CTRL_PAD else ''}{'_nodone' if NO_DONE else ''}{'_w2pf' if G2_PREFETCH else ''}{f'_ks{G1_KSTAGES}' if G1_KSTAGES else ''}{f'_g1w{G1_BN_WIDE}t{G1_WIDE_MB}' if G1_BN_WIDE else ''}"
+        f"{'_rkw' if RANK_WAVE else ''}{'_sdist' if SORT_DISTINCT else ''}"
     )
 
     # FlyDSL keys its compile cache on sources and scalar closure values; the
@@ -725,10 +914,16 @@ def compile_routed_chain(
                     if n_topk == i32_M - fx.Int32(1):
                         _wait_ge(wave, a_topk, i32_M, ACQ_ROUTE_L1 and WT_ROUTE, SPIN)
                         rmark(0)
-                        _sort_routes(
-                            lds_base, arg_tw, arg_ti, arg_stids, arg_sw, arg_eids, arg_cumsum,
-                            arg_mind, i32_M, tid, lane, wave, arg_trace, **sort_kw,
-                        )
+                        if const_expr(SORT_DISTINCT):
+                            _sort_routes_distinct(
+                                lds_base, arg_tw, arg_ti, arg_stids, arg_sw, arg_eids, arg_cumsum,
+                                arg_mind, i32_M, tid, lane, wave, arg_trace, **sort_kw,
+                            )
+                        else:
+                            _sort_routes(
+                                lds_base, arg_tw, arg_ti, arg_stids, arg_sw, arg_eids, arg_cumsum,
+                                arg_mind, i32_M, tid, lane, wave, arg_trace, **sort_kw,
+                            )
                         rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
                         rmark(12)
                         if const_expr(NO_DONE):
