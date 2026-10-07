@@ -26,6 +26,8 @@ FUSED_M_MAX = 32
 G1_BN = 128
 # Wide gemm2 tiles amortise the per-tile wait and setup; 512 needs hidden % 512 == 0.
 G2_BN = 512
+# The kernel switches gemm1 to this tile width once routing yields many m-blocks.
+G1_BN_WIDE = 256
 
 
 @functools.cache
@@ -33,8 +35,10 @@ def _launcher(m_max, ne, topk, hidden, inter, g1_bn, beta, linear_beta, trace=Fa
               route_only=False, g2_bn=G2_BN):
     if hidden % g2_bn:
         g2_bn = 256
+    g1_wide = G1_BN_WIDE if (2 * inter) % G1_BN_WIDE == 0 and G1_BN_WIDE != g1_bn else 0
     return compile_routed_chain(
         M_MAX=m_max, NE=ne, TOPK=topk, D_HIDDEN=hidden, D_INTER=inter, G1_BN=g1_bn, G2_BN=g2_bn,
+        G1_BN_WIDE=g1_wide,
         situ_beta=beta, situ_linear_beta=linear_beta, TRACE=trace, ROUTE_ONLY=route_only,
     )
 

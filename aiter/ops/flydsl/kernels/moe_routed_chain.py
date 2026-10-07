@@ -549,6 +549,8 @@ def compile_routed_chain(
     NO_DONE=True,
     G2_PREFETCH=False,
     G1_KSTAGES=0,
+    G1_BN_WIDE=0,
+    G1_WIDE_MB=96,
 ):
     """Compile the fused chain; returns the launcher.
 
@@ -598,11 +600,20 @@ def compile_routed_chain(
         K=D_HIDDEN, N_OUT=N_OUT1, NE=NE, interleave=False, native_scale_layout=True,
         num_waves=4, k_wave=1, epi_splits=epi_splits, k_stages=k_stages, wt_out=WT_INTER,
     )
+    g1w_kw = {}
+    NNB1W = NNB1
+    if G1_BN_WIDE:
+        epi_w = default_epi_splits(BM, G1_BN_WIDE)
+        ks_w = G1_KSTAGES or default_k_stages(BM, G1_BN_WIDE, G1_BK // 2, K_TILES1, N_OUT1, 1, epi_w)
+        _, _, _, lds_w = _bm_constants(BM, G1_BN_WIDE, G1_BK // 2, K_TILES1, 1, epi_w, ks_w)
+        g1_lds_bytes = max(g1_lds_bytes, lds_w)
+        g1w_kw = dict(g1_kw, BN=G1_BN_WIDE, epi_splits=epi_w, k_stages=ks_w)
+        NNB1W = N_OUT1 // G1_BN_WIDE
     name = (
         f"moe_routed_chain_m{M_MAX}_ne{NE}_k{TOPK}_h{D_HIDDEN}_i{D_INTER}"
         f"_g1bn{G1_BN}{'_hpf' if G1_PREFETCH_HIDDEN else ''}_g2bn{G2_BN}{'_nt' if G2_USE_NT else ''}"
         f"{'_trace' if TRACE else ''}{'_routeonly' if ROUTE_ONLY else ''}"
-    f"{'_g1only' if GEMM1_ONLY else ''}{'_empty' if EMPTY else ''}{'_wtr' if WT_ROUTE else ''}{'_1l' if ONE_LANE else ''}{'_aql1' if ACQ_ROUTE_L1 else ''}{'_pvb' if PIVOT_BALLOT else ''}{f'_pad{LDS_PAD}' if LDS_PAD else ''}{'_aqm1' if ACQ_MBLOCK_L1 else ''}{'_wti' if WT_INTER else ''}{f'_spin{SPIN}' if SPIN != SPIN_SLEEP else ''}{'_cpad' if CTRL_PAD else ''}{'_nodone' if NO_DONE else ''}{'_w2pf' if G2_PREFETCH else ''}{f'_ks{G1_KSTAGES}' if G1_KSTAGES else ''}"
+    f"{'_g1only' if GEMM1_ONLY else ''}{'_empty' if EMPTY else ''}{'_wtr' if WT_ROUTE else ''}{'_1l' if ONE_LANE else ''}{'_aql1' if ACQ_ROUTE_L1 else ''}{'_pvb' if PIVOT_BALLOT else ''}{f'_pad{LDS_PAD}' if LDS_PAD else ''}{'_aqm1' if ACQ_MBLOCK_L1 else ''}{'_wti' if WT_INTER else ''}{f'_spin{SPIN}' if SPIN != SPIN_SLEEP else ''}{'_cpad' if CTRL_PAD else ''}{'_nodone' if NO_DONE else ''}{'_w2pf' if G2_PREFETCH else ''}{f'_ks{G1_KSTAGES}' if G1_KSTAGES else ''}{f'_g1w{G1_BN_WIDE}t{G1_WIDE_MB}' if G1_BN_WIDE else ''}"
     )
 
     # FlyDSL keys its compile cache on sources and scalar closure values; the
@@ -613,7 +624,7 @@ def compile_routed_chain(
     else:
         W_TICKET, W_ROUTED, W_DONE, W_TOPK, W_MBLOCK, MB_STRIDE = (
             CTRL_TICKET, CTRL_ROUTED, CTRL_DONE, CTRL_TOPK, CTRL_MBLOCK, 1)
-    cache_tag = repr((name, sorted(topk_kw.items()), sorted(sort_kw.items()), sorted(g1_kw.items())))
+    cache_tag = repr((name, sorted(topk_kw.items()), sorted(sort_kw.items()), sorted(g1_kw.items()), sorted(g1w_kw.items())))
 
     def compose(*, module_name, emit_gemm2_tile, shared_storage):
         @fx.struct
@@ -722,7 +733,15 @@ def compile_routed_chain(
 
                 _wait_ge(wave, a_routed, routed_at, ACQ_ROUTE_L1 and WT_ROUTE, SPIN, NO_DONE)
                 total_mb = fx.Int32(global_typed_ptr(arg_cumsum, T.i32)[0]) // fx.Int32(BM)
-                n_g1 = total_mb * fx.Int32(NNB1)
+                # Many m-blocks: wide gemm1 tiles (fewer tiles, fixed costs amortised).
+                # Few m-blocks: narrow tiles keep more CUs streaming weights.
+                wide = fx.Int32(0)
+                nnb1 = fx.Int32(NNB1)
+                if const_expr(G1_BN_WIDE):
+                    q = total_mb // fx.Int32(G1_WIDE_MB)
+                    wide = fx.Int32(1) - fx.Int32(1) // (q + fx.Int32(1))
+                    nnb1 = fx.Int32(NNB1) - fx.Int32(NNB1 - NNB1W) * wide
+                n_g1 = total_mb * nnb1
                 n_work = i32_M + n_g1 + total_mb * fx.Int32(NNB2)
                 if const_expr(ROUTE_ONLY):
                     n_work = i32_M
@@ -734,13 +753,27 @@ def compile_routed_chain(
                         mark(t, 0)
                         wk = t - i32_M
                         if wk < n_g1:
-                            mb1 = wk // fx.Int32(NNB1)
+                            mb1 = wk // nnb1
                             mark(t, 1)
-                            _gemm1_body(
-                                g1_lds, arg_x, arg_x, arg_w1, arg_w1s, arg_eids, arg_mind,
-                                arg_inter, arg_inter_scale, arg_x, fx.Int64(0), wk, lane, wave,
-                                True, i32_M, total_mb, **g1_kw,
-                            )
+                            if const_expr(G1_BN_WIDE):
+                                if wide == fx.Int32(1):
+                                    _gemm1_body(
+                                        g1_lds, arg_x, arg_x, arg_w1, arg_w1s, arg_eids, arg_mind,
+                                        arg_inter, arg_inter_scale, arg_x, fx.Int64(0), wk, lane, wave,
+                                        True, i32_M, total_mb, **g1w_kw,
+                                    )
+                                if wide == fx.Int32(0):
+                                    _gemm1_body(
+                                        g1_lds, arg_x, arg_x, arg_w1, arg_w1s, arg_eids, arg_mind,
+                                        arg_inter, arg_inter_scale, arg_x, fx.Int64(0), wk, lane, wave,
+                                        True, i32_M, total_mb, **g1_kw,
+                                    )
+                            else:
+                                _gemm1_body(
+                                    g1_lds, arg_x, arg_x, arg_w1, arg_w1s, arg_eids, arg_mind,
+                                    arg_inter, arg_inter_scale, arg_x, fx.Int64(0), wk, lane, wave,
+                                    True, i32_M, total_mb, **g1_kw,
+                                )
                             rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
                             _bump(wave, lane, a_mblock + fx.Int64(mb1) * fx.Int64(4 * MB_STRIDE), ONE_LANE, not WT_INTER)
                             mark(t, 2)
@@ -751,7 +784,7 @@ def compile_routed_chain(
                             a_mb2 = a_mblock + fx.Int64(mb2) * fx.Int64(4 * MB_STRIDE)
                             if const_expr(G2_PREFETCH):
                                 mb_ready = rocdl.readfirstlane(T.i32, fx.Int32(comm_ops.load_i32_global_agent(a_mb2)))
-                                if mb_ready < fx.Int32(NNB1):
+                                if mb_ready < nnb1:
                                     # Touch the tile's w2 rows and scales into L2 while gemm1
                                     # still produces the m-block. Atomic loads are not dropped
                                     # as dead code and nothing waits on them before the poll.
@@ -766,7 +799,7 @@ def compile_routed_chain(
                                         if line >= fx.Int32(W2_LINES):
                                             if line < fx.Int32(W2_LINES + W2S_LINES):
                                                 comm_ops.load_i32_global_agent(s2_base + fx.Int64(line - fx.Int32(W2_LINES)) * fx.Int64(128))
-                            _wait_ge(wave, a_mb2, fx.Int32(NNB1), ACQ_MBLOCK_L1, SPIN)
+                            _wait_ge(wave, a_mb2, nnb1, ACQ_MBLOCK_L1, SPIN)
                             mark(t, 1)
                             emit_gemm2_tile(
                                 arg_inter, arg_inter_scale, arg_w2, arg_w2s, arg_eids, arg_stids,
