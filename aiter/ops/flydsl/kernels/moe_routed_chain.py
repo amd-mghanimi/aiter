@@ -97,7 +97,7 @@ def ws_layout(m_max, topk, inter, sh_inter=0, sh_ks=0):
         inter_scale=max(max_sorted * 64, max_sorted // BM * kas_per_chunk_dw_for(inter) * 4),
     )
     if sh_inter:
-        sizes["sh_part"] = sh_ks * N_WAVES * BM * 2 * sh_inter * 4
+        sizes["sh_part"] = sh_ks * N_WAVES * BM * sh_pairs(sh_inter) * 32 * 4
         sizes["sh_h"] = BM * sh_inter * 2
     offs, total = {}, 0
     for k, size in sizes.items():
@@ -805,17 +805,23 @@ def _zero_f32x4():
 @comm_ops.traced
 def _shared_gate_up(
     u, tid, lane, wave, lds_base, i32_M, arg_x, arg_w, arg_part, arg_h, a_pairs, a_pairs_done,
-    *, SH_HIDDEN, SH_INTER, SH_KS, PAIR_STRIDE, SLOT, ONE_LANE, beta, linear_beta,
+    *, SH_HIDDEN, SH_INTER, SH_KS, PAIR_STRIDE, SLOT, ONE_LANE, beta, linear_beta, WT, PRELOAD,
 ):
     """Ticket u: K split u % SH_KS of gate/up pair u / SH_KS, one K quarter per wave.
 
     Each wave stores its fp32 partial to its own slice; the last split of a pair sums
     the slices, rounds to bf16 (vLLM's gate_up GEMM output), applies SiTU (soft tanh
     clip on up, no hard clamp) and stores h.
+
+    Partials are [slice][row][pair][16 gate | 16 up]: one 128-byte line per slice, row
+    and pair, so no line holds two pairs. WT writes them through the XCD's L2, and the
+    last split then only drops its L1: nothing in this launch read the pair's lines
+    before. PRELOAD issues every load of the ticket before the first MFMA.
     """
     KC = SH_HIDDEN // SH_KS
     KW = KC // N_WAVES
     N_SLICES = SH_KS * N_WAVES
+    NP = sh_pairs(SH_INTER)
     p = u // fx.Int32(SH_KS)
     ks = u - p * fx.Int32(SH_KS)
     row = lane % fx.Int32(16)
@@ -827,31 +833,49 @@ def _shared_gate_up(
     x_dw = row * fx.Int32(SH_HIDDEN // 2) + k_dw
     g_dw = (p * fx.Int32(16) + row) * fx.Int32(SH_HIDDEN // 2) + k_dw
     u_dw = g_dw + fx.Int32(SH_INTER * SH_HIDDEN // 2)
+    steps = KW // 32
     acc_g = _zero_f32x4()
     acc_u = _zero_f32x4()
-    for s in range_constexpr(KW // 32):
-        a = _bf16x8(x_rsrc, x_dw + fx.Int32(s * 16))
-        acc_g = _mfma_bf16(a, _bf16x8(w_rsrc, g_dw + fx.Int32(s * 16)), acc_g)
-        acc_u = _mfma_bf16(a, _bf16x8(w_rsrc, u_dw + fx.Int32(s * 16)), acc_u)
+    if const_expr(PRELOAD):
+        av = [_bf16x8(x_rsrc, x_dw + fx.Int32(s * 16)) for s in range_constexpr(steps)]
+        gv = [_bf16x8(w_rsrc, g_dw + fx.Int32(s * 16)) for s in range_constexpr(steps)]
+        uv = [_bf16x8(w_rsrc, u_dw + fx.Int32(s * 16)) for s in range_constexpr(steps)]
+        for s in range_constexpr(steps):
+            acc_g = _mfma_bf16(av[s], gv[s], acc_g)
+            acc_u = _mfma_bf16(av[s], uv[s], acc_u)
+    else:
+        for s in range_constexpr(steps):
+            a = _bf16x8(x_rsrc, x_dw + fx.Int32(s * 16))
+            acc_g = _mfma_bf16(a, _bf16x8(w_rsrc, g_dw + fx.Int32(s * 16)), acc_g)
+            acc_u = _mfma_bf16(a, _bf16x8(w_rsrc, u_dw + fx.Int32(s * 16)), acc_u)
 
     # Masked buffer stores move the offset to 0x7FFFFFFF: every store resource needs
     # its real extent so the hardware drops them.
     part_rsrc = buffer_ops.create_buffer_resource_from_addr(
         fx.Int64(arg_part), num_records_bytes=N_SLICES * BM * 2 * SH_INTER * 4)
-    col = p * fx.Int32(16) + row
     slice_row0 = (ks * fx.Int32(N_WAVES) + wave) * fx.Int32(BM)
     for r in range_constexpr(4):
         m = kq * fx.Int32(4) + fx.Int32(r)
-        off = (slice_row0 + m) * fx.Int32(2 * SH_INTER) + col
-        ok = _raw(m < i32_M)
-        buffer_ops.buffer_store(_raw(fx.Float32(fx.Vector(acc_g)[r])), part_rsrc, _raw(off), mask=ok)
-        buffer_ops.buffer_store(_raw(fx.Float32(fx.Vector(acc_u)[r])), part_rsrc,
-                                _raw(off + fx.Int32(SH_INTER)), mask=ok)
+        off = ((slice_row0 + m) * fx.Int32(NP) + p) * fx.Int32(32) + row
+        vg = fx.Float32(fx.Vector(acc_g)[r])
+        vu = fx.Float32(fx.Vector(acc_u)[r])
+        if const_expr(WT):
+            if m < i32_M:
+                _st_wt(arg_part, off, vg, 4)
+                _st_wt(arg_part, off + fx.Int32(16), vu, 4)
+        else:
+            ok = _raw(m < i32_M)
+            buffer_ops.buffer_store(_raw(vg), part_rsrc, _raw(off), mask=ok)
+            buffer_ops.buffer_store(_raw(vu), part_rsrc, _raw(off + fx.Int32(16)), mask=ok)
     rocdl.s_waitcnt(vmcnt=0)
-    n = _count(wave, lane, lds_base, a_pairs + fx.Int64(p) * fx.Int64(4 * PAIR_STRIDE), SLOT, ONE_LANE)
+    n = _count(wave, lane, lds_base, a_pairs + fx.Int64(p) * fx.Int64(4 * PAIR_STRIDE), SLOT, ONE_LANE,
+               not WT)
     if n == fx.Int32(SH_KS - 1):
         if wave == fx.Int32(0):
-            comm_ops.fence_agent_acquire()
+            if const_expr(WT):
+                _llvm.InlineAsmOp(None, [], "buffer_inv sc0", "", has_side_effects=True)
+            else:
+                comm_ops.fence_agent_acquire()
         gpu.barrier()
         m = tid // fx.Int32(16)
         c = p * fx.Int32(16) + tid % fx.Int32(16)
@@ -860,9 +884,9 @@ def _shared_gate_up(
             g = fx.Float32(0.0)
             up = fx.Float32(0.0)
             for sl in range_constexpr(N_SLICES):
-                off = (fx.Int32(sl * BM) + m) * fx.Int32(2 * SH_INTER) + c
+                off = ((fx.Int32(sl * BM) + m) * fx.Int32(NP) + p) * fx.Int32(32) + tid % fx.Int32(16)
                 g = g + fx.Float32(part[off])
-                up = up + fx.Float32(part[off + fx.Int32(SH_INTER)])
+                up = up + fx.Float32(part[off + fx.Int32(16)])
             g = g.to(fx.BFloat16).to(fx.Float32)
             up = up.to(fx.BFloat16).to(fx.Float32)
             gate = fx.Float32(beta) * tanh_f32(g * fx.Float32(1.0 / beta)) * sigmoid_f32(g)
@@ -945,6 +969,8 @@ def compile_routed_chain(
     SH_KS=4,
     SH_DN_BN=64,
     SH_DN_AFTER_G1=True,
+    SH_WT=True,
+    SH_PRELOAD=True,
     sh_beta=4.0,
     sh_linear_beta=25.0,
 ):
@@ -1036,7 +1062,8 @@ def compile_routed_chain(
         f"{'_sdist' if SORT_DISTINCT else ''}{'_rks' if RANK_SPLIT else ''}{'_cbal' if CAND_BALLOT else ''}"
         f"{'_wsp' if WS_PACK else ''}"
         f"{f'_sh{SH_HIDDEN}x{SH_INTER}ks{SH_KS}dn{SH_DN_BN}b{sh_beta:g}l{sh_linear_beta:g}' if SH_INTER else ''}"
-        f"{'_dng1' if SH_INTER and SH_DN_AFTER_G1 else ''}"
+        f"{'_dng1' if SH_INTER and SH_DN_AFTER_G1 else ''}{'_shwt' if SH_INTER and SH_WT else ''}"
+        f"{'_shpl' if SH_INTER and SH_PRELOAD else ''}"
     )
     ws_offs = ws_layout(M_MAX, TOPK, D_INTER, SH_INTER, SH_KS)[0]
 
@@ -1199,7 +1226,7 @@ def compile_routed_chain(
                                 u, tid, lane, wave, lds_base, i32_M, arg_sh_x, arg_sh_wgu, arg_sh_part,
                                 arg_sh_h, a_sh_pair, a_sh_done, SH_KS=SH_KS, PAIR_STRIDE=MB_STRIDE,
                                 SLOT=L_TICKET + 7, ONE_LANE=ONE_LANE, beta=sh_beta,
-                                linear_beta=sh_linear_beta, **sh_kw,
+                                linear_beta=sh_linear_beta, WT=SH_WT, PRELOAD=SH_PRELOAD, **sh_kw,
                             )
                         if u >= fx.Int32(SH_GU_T):
                             _shared_down(
