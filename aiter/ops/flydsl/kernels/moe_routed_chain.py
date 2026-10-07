@@ -184,11 +184,20 @@ def _store(wt, base_i64, ptr, index, val, nbytes):
 
 
 @comm_ops.traced
-def _wait_ge(wave, addr, val):
-    """Spin until a control word reaches val, then acquire."""
+def _wait_ge(wave, addr, val, l1_only=False):
+    """Spin until a control word reaches val, then acquire.
+
+    l1_only drops only this CU's L1. That is enough when everything the word
+    guards was written through (_st_wt) before it was raised and nothing in
+    this launch read those lines earlier: the dispatch already invalidated L2.
+    """
     if wave == fx.Int32(0):
         _spin_ge(addr, val)
-        comm_ops.fence_agent_acquire()
+        if const_expr(l1_only):
+            rocdl.s_waitcnt(vmcnt=0)
+            _llvm.InlineAsmOp(None, [], "buffer_inv sc0", "", has_side_effects=True)
+        else:
+            comm_ops.fence_agent_acquire()
     gpu.barrier()
 
 
@@ -481,6 +490,7 @@ def compile_routed_chain(
     EMPTY=False,
     WT_ROUTE=True,
     ONE_LANE=True,
+    ACQ_ROUTE_L1=True,
 ):
     """Compile the fused chain; returns the launcher.
 
@@ -530,7 +540,7 @@ def compile_routed_chain(
         f"moe_routed_chain_m{M_MAX}_ne{NE}_k{TOPK}_h{D_HIDDEN}_i{D_INTER}"
         f"_g1bn{G1_BN}{'_hpf' if G1_PREFETCH_HIDDEN else ''}_g2bn{G2_BN}{'_nt' if G2_USE_NT else ''}"
         f"{'_trace' if TRACE else ''}{'_routeonly' if ROUTE_ONLY else ''}"
-    f"{'_g1only' if GEMM1_ONLY else ''}{'_empty' if EMPTY else ''}{'_wtr' if WT_ROUTE else ''}{'_1l' if ONE_LANE else ''}"
+    f"{'_g1only' if GEMM1_ONLY else ''}{'_empty' if EMPTY else ''}{'_wtr' if WT_ROUTE else ''}{'_1l' if ONE_LANE else ''}{'_aql1' if ACQ_ROUTE_L1 else ''}"
     )
 
     def compose(*, module_name, emit_gemm2_tile, shared_storage):
@@ -607,7 +617,7 @@ def compile_routed_chain(
                     rmark(9)
                     mark(t, 1)
                     if n_topk == i32_M - fx.Int32(1):
-                        _wait_ge(wave, a_topk, i32_M)
+                        _wait_ge(wave, a_topk, i32_M, ACQ_ROUTE_L1 and WT_ROUTE)
                         rmark(0)
                         _sort_routes(
                             lds_base, arg_tw, arg_ti, arg_stids, arg_sw, arg_eids, arg_cumsum,
@@ -620,7 +630,7 @@ def compile_routed_chain(
                     mark(t, 2)
                     t = _grab(wave, lane, lds_base, a_ticket, L_TICKET + 4, ONE_LANE)
 
-                _wait_ge(wave, a_routed, fx.Int32(1))
+                _wait_ge(wave, a_routed, fx.Int32(1), ACQ_ROUTE_L1 and WT_ROUTE)
                 total_mb = fx.Int32(global_typed_ptr(arg_cumsum, T.i32)[0]) // fx.Int32(BM)
                 n_g1 = total_mb * fx.Int32(NNB1)
                 n_work = i32_M + n_g1 + total_mb * fx.Int32(NNB2)
