@@ -89,6 +89,8 @@ fptr_t latent_ag_init(int64_t rank, int64_t world_size, int64_t max_m, int64_t s
 
 void latent_ag_destroy(fptr_t fa)
 {
+    if (fa == 0)
+        return;
     delete reinterpret_cast<LatentAgState*>(fa);
 }
 
@@ -101,8 +103,11 @@ void latent_ag_get_handle(fptr_t fa, int64_t out_ptr)
 void latent_ag_open_handles(fptr_t fa, const std::vector<int64_t>& handle_ptrs)
 {
     auto* st = reinterpret_cast<LatentAgState*>(fa);
+    if (st->opened)
+        throw std::runtime_error("latent_ag: handles already open");
     if ((int)handle_ptrs.size() != st->world)
         throw std::invalid_argument("latent_ag: handle count != world");
+    static_assert(sizeof(hipIpcMemHandle_t) == 64, "host copies a 64-byte IPC handle");
     for (int i = 0; i < st->world; ++i) {
         if (i == st->rank) {
             st->peer_ptrs_host[i] = st->local_mailbox;

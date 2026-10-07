@@ -10,7 +10,7 @@ using fptr_t = int64_t;
 
 namespace aiter {
 
-// Opaque handle for the latent-AG mailbox state (IPC + epoch flags).
+// Opaque handle for the column-shard all-gather (IPC mailboxes + epoch flags).
 fptr_t latent_ag_init(int64_t rank, int64_t world_size, int64_t max_m, int64_t shard_n);
 void latent_ag_destroy(fptr_t fa);
 void latent_ag_get_handle(fptr_t fa, int64_t out_ptr);

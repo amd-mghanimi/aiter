@@ -1,9 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Latent-MoE all-gather mailbox (F2 S2).
+"""All-gather of a column-parallel GEMM shard (latent-MoE up projection).
 
-LL flag-in-data publish of a column shard, then poll-assemble into the full
-hidden. Host API for the HIP kernels in ``module_latent_ag_mailbox``.
+Each rank holds ``shard`` of shape ``[M, shard_n]`` bf16, the local N-slice
+of a skinny GEMM (Kimi-K3: ``shard_n = 7168 / TP``, ``M <= 16``). The kernel
+publishes that slice into peer IPC mailboxes as LL flag-in-data packets, then
+polls and writes the full hidden ``[M, shard_n * world]``.
+
+The GEMM writes a column shard and this collective all-gathers it. The
+row-parallel o_proj path is separate: that GEMM writes the full ``N`` and
+QuickReduce sums the partials.
+
+``develop=True`` is required: the JIT module is ``torch_exclude`` and the
+push/poll entry takes ``aiter_tensor_t``.
 """
 
 from __future__ import annotations
@@ -76,10 +85,13 @@ class LatentAgMailbox:
         mine = bytes(buf.tolist())
         handles: list[bytes | None] = [None] * self.world_size
         dist.all_gather_object(handles, mine, group=self.group)
+        # Keep the tensors alive: open_handles reads the pointers, it does not copy.
         keep: list[torch.Tensor] = []
         ptrs: list[int] = []
         for h in handles:
-            assert h is not None and len(h) == _HIP_IPC_HANDLE_BYTES
+            if h is None or len(h) != _HIP_IPC_HANDLE_BYTES:
+                got = None if h is None else len(h)
+                raise ValueError(f"IPC handle must be {_HIP_IPC_HANDLE_BYTES} bytes, got {got}")
             t = torch.tensor(list(h), dtype=torch.uint8)
             keep.append(t)
             ptrs.append(int(t.data_ptr()))
@@ -87,20 +99,30 @@ class LatentAgMailbox:
         latent_ag_open_handles(self._fa, ptrs)
 
     def allgather(self, shard: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+        """Gather column shards. ``shard`` is ``[M, shard_n]``; result is ``[M, shard_n * world]``."""
+        if self._closed:
+            raise RuntimeError("LatentAgMailbox is closed")
         if shard.dtype != torch.bfloat16 or shard.dim() != 2:
             raise ValueError("shard must be bf16 [M, shard_n]")
-        if shard.shape[1] != self.shard_n:
+        if shard.device != self.device:
+            raise ValueError(f"shard device {shard.device} != mailbox device {self.device}")
+        m = int(shard.shape[0])
+        if int(shard.shape[1]) != self.shard_n:
             raise ValueError(f"shard_n mismatch: {shard.shape[1]} vs {self.shard_n}")
-        if shard.shape[0] > self.max_m:
-            raise ValueError(f"M={shard.shape[0]} > max_m={self.max_m}")
+        if m > self.max_m or m < 1:
+            raise ValueError(f"M={m} is outside [1, {self.max_m}]")
+        full_n = self.shard_n * self.world_size
         if out is None:
-            out = torch.empty(
-                shard.shape[0],
-                self.shard_n * self.world_size,
-                dtype=torch.bfloat16,
-                device=shard.device,
-            )
-        latent_ag_push_poll(self._fa, shard.contiguous(), out)
+            out = torch.empty(m, full_n, dtype=torch.bfloat16, device=shard.device)
+        elif (
+            out.dtype != torch.bfloat16
+            or out.dim() != 2
+            or tuple(out.shape) != (m, full_n)
+            or out.device != shard.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError(f"out must be contiguous bf16 [{m}, {full_n}] on {shard.device}")
+        latent_ag_push_poll(self._fa, shard if shard.is_contiguous() else shard.contiguous(), out)
         return out
 
     def close(self) -> None:
