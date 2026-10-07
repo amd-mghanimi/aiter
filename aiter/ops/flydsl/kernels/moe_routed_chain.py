@@ -944,6 +944,7 @@ def compile_routed_chain(
     SH_HIDDEN=7168,
     SH_KS=4,
     SH_DN_BN=64,
+    SH_DN_AFTER_G1=True,
     sh_beta=4.0,
     sh_linear_beta=25.0,
 ):
@@ -957,6 +958,9 @@ def compile_routed_chain(
     gate and up, hidden SH_HIDDEN) as tickets after the top-k ones, so it runs
     while routing holds the other workgroups back: SH_INTER / 16 * SH_KS gate/up
     tickets, then SH_HIDDEN / SH_DN_BN down tickets that wait for all of gate/up.
+    SH_DN_AFTER_G1 numbers the down tickets after gemm1, where gemm2 tiles would
+    only wait for their m-blocks: gate/up is long done by then, and no workgroup
+    sits on a CU waiting for it while gemm1 needs one.
     sh_linear_beta <= 0 passes up through unclipped. M must be <= BM.
     """
     assert NE % N_WAVES == 0 and TOPK <= WAVE
@@ -964,7 +968,10 @@ def compile_routed_chain(
         assert WS_PACK and SH_INTER % 32 == 0 and SH_HIDDEN % (SH_KS * N_WAVES * 32) == 0
         assert SH_DN_BN % (16 * N_WAVES) == 0 and SH_HIDDEN % SH_DN_BN == 0
     SH_GU_T = sh_pairs(SH_INTER) * SH_KS if SH_INTER else 0
-    SH_T = SH_GU_T + (SH_HIDDEN // SH_DN_BN if SH_INTER else 0)
+    SH_DN_T = SH_HIDDEN // SH_DN_BN if SH_INTER else 0
+    SH_T = SH_GU_T + SH_DN_T
+    SH_PRE = SH_GU_T if SH_DN_AFTER_G1 else SH_T
+    SH_MID = SH_DN_T if SH_DN_AFTER_G1 else 0
     G1_BK = 256
     N_OUT1 = 2 * D_INTER
     NNB1 = N_OUT1 // G1_BN
@@ -1029,6 +1036,7 @@ def compile_routed_chain(
         f"{'_sdist' if SORT_DISTINCT else ''}{'_rks' if RANK_SPLIT else ''}{'_cbal' if CAND_BALLOT else ''}"
         f"{'_wsp' if WS_PACK else ''}"
         f"{f'_sh{SH_HIDDEN}x{SH_INTER}ks{SH_KS}dn{SH_DN_BN}b{sh_beta:g}l{sh_linear_beta:g}' if SH_INTER else ''}"
+        f"{'_dng1' if SH_INTER and SH_DN_AFTER_G1 else ''}"
     )
     ws_offs = ws_layout(M_MAX, TOPK, D_INTER, SH_INTER, SH_KS)[0]
 
@@ -1183,7 +1191,7 @@ def compile_routed_chain(
                     t = _grab(wave, lane, lds_base, a_ticket, L_TICKET + 4, ONE_LANE)
 
                 if const_expr(SH_INTER):
-                    while t < i32_M + fx.Int32(SH_T):
+                    while t < i32_M + fx.Int32(SH_PRE):
                         mark(t, 0)
                         u = t - i32_M
                         if u < fx.Int32(SH_GU_T):
@@ -1213,8 +1221,9 @@ def compile_routed_chain(
                     wide = fx.Int32(1) - fx.Int32(1) // (q + fx.Int32(1))
                     nnb1 = fx.Int32(NNB1) - fx.Int32(NNB1 - NNB1W) * wide
                 n_g1 = total_mb * nnb1
-                t0 = i32_M + fx.Int32(SH_T)
-                n_work = t0 + n_g1 + total_mb * fx.Int32(NNB2)
+                t0 = i32_M + fx.Int32(SH_PRE)
+                g2_0 = n_g1 + fx.Int32(SH_MID)
+                n_work = t0 + g2_0 + total_mb * fx.Int32(NNB2)
                 if const_expr(ROUTE_ONLY):
                     n_work = t0
                 if const_expr(GEMM1_ONLY):
@@ -1249,8 +1258,18 @@ def compile_routed_chain(
                             rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
                             _bump(wave, lane, a_mblock + fx.Int64(mb1) * fx.Int64(4 * MB_STRIDE), ONE_LANE, not WT_INTER)
                             mark(t, 2)
-                        if wk >= n_g1:
-                            u = wk - n_g1
+                        if const_expr(SH_MID):
+                            if wk >= n_g1:
+                                if wk < g2_0:
+                                    mark(t, 1)
+                                    _shared_down(
+                                        wk - n_g1, lane, wave, i32_M, arg_sh_h, arg_sh_wdn, arg_sh_out,
+                                        a_sh_done, SH_DN_BN=SH_DN_BN, SPIN=SPIN, **sh_kw,
+                                    )
+                                    rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
+                                    mark(t, 2)
+                        if wk >= g2_0:
+                            u = wk - g2_0
                             mb2 = u // fx.Int32(NNB2)
                             nb2 = u - mb2 * fx.Int32(NNB2)
                             a_mb2 = a_mblock + fx.Int64(mb2) * fx.Int64(4 * MB_STRIDE)
