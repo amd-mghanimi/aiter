@@ -9,8 +9,9 @@ drain. This kernel runs the same work under one persistent grid.
 Workgroups loop on a global ticket counter and the ticket picks the work item:
 
     0 .. M-1                        top-k of token t, zero its output row
-    M .. M+G1-1                     gemm1 tile
-    M+G1 ..                         gemm2 tile, m-block major
+    M .. M+S-1                      shared expert (optional): gate/up K splits, then down
+    M+S .. M+S+G1-1                 gemm1 tile
+    M+S+G1 ..                       gemm2 tile, m-block major
 
 The workgroup that finishes the last top-k also sorts the routes and raises
 the route flag. A gemm1 tile waits for that flag; a gemm2 tile also waits for
@@ -30,14 +31,16 @@ from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
+from . import buffer_ops
 from . import communication_ops_utils as comm_ops
+from .act import sigmoid_f32, tanh_f32
 from .mxfp4_gemm1 import (
     _bm_constants,
     _gemm1_body,
     default_epi_splits,
     default_k_stages,
 )
-from .mxfp4_gemm_common import global_typed_ptr, kas_per_chunk_dw_for, lds_typed_ptr
+from .mxfp4_gemm_common import _raw, global_typed_ptr, kas_per_chunk_dw_for, lds_typed_ptr
 from .mxmoe_dispatcher import compile_gemm2_a4w4_port
 
 BM = 16
@@ -62,19 +65,29 @@ def max_m_blocks(m, topk):
     return m * topk
 
 
-def ctrl_words(m_max, topk):
-    return LINE_WORDS * (4 + max_m_blocks(m_max, topk))
+def sh_pairs(sh_inter):
+    """Shared-expert gate/up column pairs: 16 gate and the matching 16 up columns each."""
+    return sh_inter // 16
 
 
-def ws_layout(m_max, topk, inter):
+def ctrl_words(m_max, topk, sh_inter=0):
+    """Per line: ticket, routed, done, top-k, the m-block counters, then with a shared
+    expert one counter per gate/up pair and the pairs-done counter."""
+    sh_lines = sh_pairs(sh_inter) + 1 if sh_inter else 0
+    return LINE_WORDS * (4 + max_m_blocks(m_max, topk) + sh_lines)
+
+
+def ws_layout(m_max, topk, inter, sh_inter=0, sh_ks=0):
     """Byte offsets of the workspace buffers inside one allocation, and its size.
 
     Every offset is a compile-time constant, so with WS_PACK the kernel reaches all
     buffers from the control-word pointer and keeps one live address, not eight.
+    The shared expert adds the gate/up K-split partials (fp32, one slice per wave of
+    each K split, BM rows) and its bf16 activation h.
     """
     max_sorted = m_max * topk * BM
     sizes = dict(
-        ctrl=ctrl_words(m_max, topk) * 4,
+        ctrl=ctrl_words(m_max, topk, sh_inter) * 4,
         stids=max_sorted * 4,
         sw=max_sorted * 4,
         eids=max_m_blocks(m_max, topk) * 4,
@@ -83,6 +96,9 @@ def ws_layout(m_max, topk, inter):
         inter=max_sorted * (inter // 2),
         inter_scale=max(max_sorted * 64, max_sorted // BM * kas_per_chunk_dw_for(inter) * 4),
     )
+    if sh_inter:
+        sizes["sh_part"] = sh_ks * N_WAVES * BM * 2 * sh_inter * 4
+        sizes["sh_h"] = BM * sh_inter * 2
     offs, total = {}, 0
     for k, size in sizes.items():
         offs[k] = total
@@ -768,6 +784,122 @@ def _sort_routes_distinct(
             _store(WT, arg_sw, sw, rr, fx.Float32(0.0), 4)
 
 
+# Shared expert (bf16, unquantized): h = situ(x Wg^T, x Wu^T), y = h Wd^T, rows < M <= BM.
+# Both GEMMs use mfma_f32_16x16x32_bf16 straight from global memory: lane l feeds row
+# l % 16 and K elements (l / 16) * 8 .. + 8 of A and of B (B row = weight row), and
+# gets back rows (l / 16) * 4 + r, column l % 16. Buffer resources sized to M rows
+# return zeros for the padding rows.
+def _bf16x8(rsrc, off_dw):
+    v = buffer_ops.buffer_load(rsrc, _raw(off_dw), vec_width=4, dtype=T.i32)
+    return fx.Vector(v).bitcast(fx.BFloat16)
+
+
+def _mfma_bf16(a8, b8, acc):
+    return rocdl.mfma_f32_16x16x32_bf16(T.f32x4, [_raw(a8), _raw(b8), _raw(acc), 0, 0, 0])
+
+
+def _zero_f32x4():
+    return fx.Vector.from_elements([_raw(fx.Float32(0.0))] * 4, fx.Float32)
+
+
+@comm_ops.traced
+def _shared_gate_up(
+    u, tid, lane, wave, lds_base, i32_M, arg_x, arg_w, arg_part, arg_h, a_pairs, a_pairs_done,
+    *, SH_HIDDEN, SH_INTER, SH_KS, PAIR_STRIDE, SLOT, ONE_LANE, beta, linear_beta,
+):
+    """Ticket u: K split u % SH_KS of gate/up pair u / SH_KS, one K quarter per wave.
+
+    Each wave stores its fp32 partial to its own slice; the last split of a pair sums
+    the slices, rounds to bf16 (vLLM's gate_up GEMM output), applies SiTU (soft tanh
+    clip on up, no hard clamp) and stores h.
+    """
+    KC = SH_HIDDEN // SH_KS
+    KW = KC // N_WAVES
+    N_SLICES = SH_KS * N_WAVES
+    p = u // fx.Int32(SH_KS)
+    ks = u - p * fx.Int32(SH_KS)
+    row = lane % fx.Int32(16)
+    kq = lane // fx.Int32(16)
+    x_rsrc = buffer_ops.create_buffer_resource_from_addr(
+        fx.Int64(arg_x), num_records_bytes=fx.Int64(i32_M) * fx.Int64(SH_HIDDEN * 2))
+    w_rsrc = buffer_ops.create_buffer_resource_from_addr(fx.Int64(arg_w))
+    k_dw = ks * fx.Int32(KC // 2) + wave * fx.Int32(KW // 2) + kq * fx.Int32(4)
+    x_dw = row * fx.Int32(SH_HIDDEN // 2) + k_dw
+    g_dw = (p * fx.Int32(16) + row) * fx.Int32(SH_HIDDEN // 2) + k_dw
+    u_dw = g_dw + fx.Int32(SH_INTER * SH_HIDDEN // 2)
+    acc_g = _zero_f32x4()
+    acc_u = _zero_f32x4()
+    for s in range_constexpr(KW // 32):
+        a = _bf16x8(x_rsrc, x_dw + fx.Int32(s * 16))
+        acc_g = _mfma_bf16(a, _bf16x8(w_rsrc, g_dw + fx.Int32(s * 16)), acc_g)
+        acc_u = _mfma_bf16(a, _bf16x8(w_rsrc, u_dw + fx.Int32(s * 16)), acc_u)
+
+    part_rsrc = buffer_ops.create_buffer_resource_from_addr(fx.Int64(arg_part))
+    col = p * fx.Int32(16) + row
+    slice_row0 = (ks * fx.Int32(N_WAVES) + wave) * fx.Int32(BM)
+    for r in range_constexpr(4):
+        m = kq * fx.Int32(4) + fx.Int32(r)
+        off = (slice_row0 + m) * fx.Int32(2 * SH_INTER) + col
+        ok = _raw(m < i32_M)
+        buffer_ops.buffer_store(_raw(fx.Float32(fx.Vector(acc_g)[r])), part_rsrc, _raw(off), mask=ok)
+        buffer_ops.buffer_store(_raw(fx.Float32(fx.Vector(acc_u)[r])), part_rsrc,
+                                _raw(off + fx.Int32(SH_INTER)), mask=ok)
+    rocdl.s_waitcnt(vmcnt=0)
+    n = _count(wave, lane, lds_base, a_pairs + fx.Int64(p) * fx.Int64(4 * PAIR_STRIDE), SLOT, ONE_LANE)
+    if n == fx.Int32(SH_KS - 1):
+        if wave == fx.Int32(0):
+            comm_ops.fence_agent_acquire()
+        gpu.barrier()
+        m = tid // fx.Int32(16)
+        c = p * fx.Int32(16) + tid % fx.Int32(16)
+        if m < i32_M:
+            part = global_typed_ptr(arg_part, T.f32)
+            g = fx.Float32(0.0)
+            up = fx.Float32(0.0)
+            for sl in range_constexpr(N_SLICES):
+                off = (fx.Int32(sl * BM) + m) * fx.Int32(2 * SH_INTER) + c
+                g = g + fx.Float32(part[off])
+                up = up + fx.Float32(part[off + fx.Int32(SH_INTER)])
+            g = g.to(fx.BFloat16).to(fx.Float32)
+            up = up.to(fx.BFloat16).to(fx.Float32)
+            gate = fx.Float32(beta) * tanh_f32(g * fx.Float32(1.0 / beta)) * sigmoid_f32(g)
+            if const_expr(linear_beta > 0):
+                up = fx.Float32(linear_beta) * tanh_f32(up * fx.Float32(1.0 / linear_beta))
+            h_rsrc = buffer_ops.create_buffer_resource_from_addr(fx.Int64(arg_h))
+            buffer_ops.buffer_store(_raw((gate * up).to(fx.BFloat16)), h_rsrc,
+                                    _raw(m * fx.Int32(SH_INTER) + c))
+        rocdl.s_waitcnt(vmcnt=0)
+        _bump(wave, lane, a_pairs_done, ONE_LANE)
+
+
+@comm_ops.traced
+def _shared_down(
+    nb, lane, wave, i32_M, arg_h, arg_w, arg_out, a_pairs_done,
+    *, SH_HIDDEN, SH_INTER, SH_DN_BN, SPIN,
+):
+    """Ticket nb: output columns nb * SH_DN_BN .. + SH_DN_BN, 16 per wave per pass, full K."""
+    _wait_ge(wave, a_pairs_done, sh_pairs(SH_INTER), False, SPIN)
+    row = lane % fx.Int32(16)
+    kq = lane // fx.Int32(16)
+    h_rsrc = buffer_ops.create_buffer_resource_from_addr(
+        fx.Int64(arg_h), num_records_bytes=fx.Int64(i32_M) * fx.Int64(SH_INTER * 2))
+    w_rsrc = buffer_ops.create_buffer_resource_from_addr(fx.Int64(arg_w))
+    o_rsrc = buffer_ops.create_buffer_resource_from_addr(fx.Int64(arg_out))
+    h_dw = row * fx.Int32(SH_INTER // 2) + kq * fx.Int32(4)
+    for sub in range_constexpr(SH_DN_BN // (16 * N_WAVES)):
+        n0 = nb * fx.Int32(SH_DN_BN) + (fx.Int32(sub * N_WAVES) + wave) * fx.Int32(16)
+        w_dw = (n0 + row) * fx.Int32(SH_INTER // 2) + kq * fx.Int32(4)
+        acc = _zero_f32x4()
+        for s in range_constexpr(SH_INTER // 32):
+            acc = _mfma_bf16(_bf16x8(h_rsrc, h_dw + fx.Int32(s * 16)),
+                             _bf16x8(w_rsrc, w_dw + fx.Int32(s * 16)), acc)
+        for r in range_constexpr(4):
+            m = kq * fx.Int32(4) + fx.Int32(r)
+            buffer_ops.buffer_store(
+                _raw(fx.Float32(fx.Vector(acc)[r]).to(fx.BFloat16)), o_rsrc,
+                _raw(m * fx.Int32(SH_HIDDEN) + n0 + row), mask=_raw(m < i32_M))
+
+
 def compile_routed_chain(
     *,
     M_MAX=16,
@@ -804,14 +936,31 @@ def compile_routed_chain(
     RANK_SPLIT=True,
     CAND_BALLOT=True,
     WS_PACK=True,
+    SH_INTER=0,
+    SH_HIDDEN=7168,
+    SH_KS=4,
+    SH_DN_BN=64,
+    sh_beta=4.0,
+    sh_linear_beta=25.0,
 ):
     """Compile the fused chain; returns the launcher.
 
     TRACE: arg_trace receives ROUTE_MARKS i64 for the sort, then four i64 per
     ticket (start, dependencies met, end); the unit is the 100 MHz
     s_memrealtime clock.
+
+    SH_INTER > 0 adds the bf16 shared expert (this rank's SH_INTER columns of
+    gate and up, hidden SH_HIDDEN) as tickets after the top-k ones, so it runs
+    while routing holds the other workgroups back: SH_INTER / 16 * SH_KS gate/up
+    tickets, then SH_HIDDEN / SH_DN_BN down tickets that wait for all of gate/up.
+    sh_linear_beta <= 0 passes up through unclipped. M must be <= BM.
     """
     assert NE % N_WAVES == 0 and TOPK <= WAVE
+    if SH_INTER:
+        assert WS_PACK and SH_INTER % 32 == 0 and SH_HIDDEN % (SH_KS * N_WAVES * 32) == 0
+        assert SH_DN_BN % (16 * N_WAVES) == 0 and SH_HIDDEN % SH_DN_BN == 0
+    SH_GU_T = sh_pairs(SH_INTER) * SH_KS if SH_INTER else 0
+    SH_T = SH_GU_T + (SH_HIDDEN // SH_DN_BN if SH_INTER else 0)
     G1_BK = 256
     N_OUT1 = 2 * D_INTER
     NNB1 = N_OUT1 // G1_BN
@@ -875,8 +1024,9 @@ def compile_routed_chain(
     f"{'_g1only' if GEMM1_ONLY else ''}{f'_empty{EMPTY}' if EMPTY else ''}{'_wtr' if WT_ROUTE else ''}{'_1l' if ONE_LANE else ''}{'_aql1' if ACQ_ROUTE_L1 else ''}{'_pvb' if PIVOT_BALLOT else ''}{f'_pad{LDS_PAD}' if LDS_PAD else ''}{'_aqm1' if ACQ_MBLOCK_L1 else ''}{'_wti' if WT_INTER else ''}{f'_spin{SPIN}' if SPIN != SPIN_SLEEP else ''}{'_cpad' if CTRL_PAD else ''}{'_nodone' if NO_DONE else ''}{'_w2pf' if G2_PREFETCH else ''}{f'_ks{G1_KSTAGES}' if G1_KSTAGES else ''}{f'_g1w{G1_BN_WIDE}t{G1_WIDE_MB}' if G1_BN_WIDE else ''}"
         f"{'_sdist' if SORT_DISTINCT else ''}{'_rks' if RANK_SPLIT else ''}{'_cbal' if CAND_BALLOT else ''}"
         f"{'_wsp' if WS_PACK else ''}"
+        f"{f'_sh{SH_HIDDEN}x{SH_INTER}ks{SH_KS}dn{SH_DN_BN}b{sh_beta:g}l{sh_linear_beta:g}' if SH_INTER else ''}"
     )
-    ws_offs = ws_layout(M_MAX, TOPK, D_INTER)[0]
+    ws_offs = ws_layout(M_MAX, TOPK, D_INTER, SH_INTER, SH_KS)[0]
 
     # FlyDSL keys its compile cache on sources and scalar closure values; the
     # knob dicts reach the kernel only through calls, so key on them here.
@@ -886,6 +1036,9 @@ def compile_routed_chain(
     else:
         W_TICKET, W_ROUTED, W_DONE, W_TOPK, W_MBLOCK, MB_STRIDE = (
             CTRL_TICKET, CTRL_ROUTED, CTRL_DONE, CTRL_TOPK, CTRL_MBLOCK, 1)
+    W_SH_PAIR = W_MBLOCK + max_m_blocks(M_MAX, TOPK) * MB_STRIDE
+    W_SH_DONE = W_SH_PAIR + sh_pairs(SH_INTER) * MB_STRIDE
+    sh_kw = dict(SH_HIDDEN=SH_HIDDEN, SH_INTER=SH_INTER)
     cache_tag = repr((name, sorted(topk_kw.items()), sorted(sort_kw.items()), sorted(g1_kw.items()), sorted(g1w_kw.items())))
 
     def compose(*, module_name, emit_gemm2_tile, shared_storage):
@@ -921,6 +1074,10 @@ def compile_routed_chain(
             arg_mind: fx.Int64,
             arg_inter: fx.Int64,
             arg_inter_scale: fx.Int64,
+            arg_sh_x: fx.Int64,
+            arg_sh_wgu: fx.Int64,
+            arg_sh_wdn: fx.Int64,
+            arg_sh_out: fx.Int64,
             arg_trace: fx.Int64,
             i32_M: fx.Int32,
             i32_grid: fx.Int32,
@@ -952,6 +1109,11 @@ def compile_routed_chain(
             a_done = ctrl + fx.Int64(W_DONE * 4)
             a_topk = ctrl + fx.Int64(W_TOPK * 4)
             a_mblock = ctrl + fx.Int64(W_MBLOCK * 4)
+            if const_expr(SH_INTER):
+                a_sh_pair = ctrl + fx.Int64(W_SH_PAIR * 4)
+                a_sh_done = ctrl + fx.Int64(W_SH_DONE * 4)
+                arg_sh_part = ctrl + fx.Int64(ws_offs["sh_part"])
+                arg_sh_h = ctrl + fx.Int64(ws_offs["sh_h"])
 
             def mark(t, k):
                 if const_expr(TRACE):
@@ -1016,6 +1178,26 @@ def compile_routed_chain(
                     mark(t, 2)
                     t = _grab(wave, lane, lds_base, a_ticket, L_TICKET + 4, ONE_LANE)
 
+                if const_expr(SH_INTER):
+                    while t < i32_M + fx.Int32(SH_T):
+                        mark(t, 0)
+                        u = t - i32_M
+                        if u < fx.Int32(SH_GU_T):
+                            _shared_gate_up(
+                                u, tid, lane, wave, lds_base, i32_M, arg_sh_x, arg_sh_wgu, arg_sh_part,
+                                arg_sh_h, a_sh_pair, a_sh_done, SH_KS=SH_KS, PAIR_STRIDE=MB_STRIDE,
+                                SLOT=L_TICKET + 7, ONE_LANE=ONE_LANE, beta=sh_beta,
+                                linear_beta=sh_linear_beta, **sh_kw,
+                            )
+                        if u >= fx.Int32(SH_GU_T):
+                            _shared_down(
+                                u - fx.Int32(SH_GU_T), lane, wave, i32_M, arg_sh_h, arg_sh_wdn, arg_sh_out,
+                                a_sh_done, SH_DN_BN=SH_DN_BN, SPIN=SPIN, **sh_kw,
+                            )
+                        rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
+                        mark(t, 2)
+                        t = _grab(wave, lane, lds_base, a_ticket, L_TICKET + 6, ONE_LANE)
+
                 _wait_ge(wave, a_routed, routed_at, ACQ_ROUTE_L1 and WT_ROUTE, SPIN, NO_DONE)
                 total_mb = fx.Int32(global_typed_ptr(arg_cumsum, T.i32)[0]) // fx.Int32(BM)
                 # Many m-blocks: wide gemm1 tiles (fewer tiles, fixed costs amortised).
@@ -1027,16 +1209,17 @@ def compile_routed_chain(
                     wide = fx.Int32(1) - fx.Int32(1) // (q + fx.Int32(1))
                     nnb1 = fx.Int32(NNB1) - fx.Int32(NNB1 - NNB1W) * wide
                 n_g1 = total_mb * nnb1
-                n_work = i32_M + n_g1 + total_mb * fx.Int32(NNB2)
+                t0 = i32_M + fx.Int32(SH_T)
+                n_work = t0 + n_g1 + total_mb * fx.Int32(NNB2)
                 if const_expr(ROUTE_ONLY):
-                    n_work = i32_M
+                    n_work = t0
                 if const_expr(GEMM1_ONLY):
-                    n_work = i32_M + n_g1
+                    n_work = t0 + n_g1
 
                 if const_expr(not ROUTE_ONLY):
                     while t < n_work:
                         mark(t, 0)
-                        wk = t - i32_M
+                        wk = t - t0
                         if wk < n_g1:
                             mb1 = wk // nnb1
                             mark(t, 1)
@@ -1104,6 +1287,9 @@ def compile_routed_chain(
                     ctrl32 = global_typed_ptr(arg_ctrl, T.i32)
                     for i in range(tid, mb_max, fx.Int32(THREADS)):
                         ctrl32[fx.Int32(W_MBLOCK) + i * fx.Int32(MB_STRIDE)] = fx.Int32(0)
+                    if const_expr(SH_INTER):
+                        if tid <= fx.Int32(sh_pairs(SH_INTER)):
+                            ctrl32[fx.Int32(W_SH_PAIR) + tid * fx.Int32(MB_STRIDE)] = fx.Int32(0)
                     if tid == fx.Int32(0):
                         ctrl32[W_TICKET] = fx.Int32(0)
                         ctrl32[W_TOPK] = fx.Int32(0)
@@ -1116,6 +1302,9 @@ def compile_routed_chain(
                     ctrl32 = global_typed_ptr(arg_ctrl, T.i32)
                     for i in range(tid, mb_max, fx.Int32(THREADS)):
                         ctrl32[fx.Int32(W_MBLOCK) + i * fx.Int32(MB_STRIDE)] = fx.Int32(0)
+                    if const_expr(SH_INTER):
+                        if tid <= fx.Int32(sh_pairs(SH_INTER)):
+                            ctrl32[fx.Int32(W_SH_PAIR) + tid * fx.Int32(MB_STRIDE)] = fx.Int32(0)
                     if tid == fx.Int32(0):
                         ctrl32[W_TICKET] = fx.Int32(0)
                         ctrl32[W_ROUTED] = fx.Int32(0)
@@ -1142,6 +1331,10 @@ def compile_routed_chain(
             arg_mind: fx.Int64,
             arg_inter: fx.Int64,
             arg_inter_scale: fx.Int64,
+            arg_sh_x: fx.Int64,
+            arg_sh_wgu: fx.Int64,
+            arg_sh_wdn: fx.Int64,
+            arg_sh_out: fx.Int64,
             arg_trace: fx.Int64,
             i32_M: fx.Int32,
             i32_grid: fx.Int32,
@@ -1150,7 +1343,8 @@ def compile_routed_chain(
             routed_chain_kernel(
                 arg_logits, arg_bias, arg_x, arg_w1, arg_w1s, arg_w2, arg_w2s, arg_out,
                 arg_tw, arg_ti, arg_ctrl, arg_stids, arg_sw, arg_eids, arg_cumsum, arg_mind,
-                arg_inter, arg_inter_scale, arg_trace, i32_M, i32_grid,
+                arg_inter, arg_inter_scale, arg_sh_x, arg_sh_wgu, arg_sh_wdn, arg_sh_out,
+                arg_trace, i32_M, i32_grid,
             ).launch(grid=(fx.Int64(i32_grid), 1, 1), block=(THREADS, 1, 1), stream=stream)
 
         return launch_routed_chain
@@ -1160,5 +1354,5 @@ def compile_routed_chain(
         INTER_MAX=D_INTER, a_dtype="fp4", b_dtype="fp4", SBM=BM, g2_kstatic=True,
         _composition=compose,
     )
-    launch.chain_meta = dict(NNB1=NNB1, NNB2=NNB2, M_MAX=M_MAX, TOPK=TOPK)
+    launch.chain_meta = dict(NNB1=NNB1, NNB2=NNB2, M_MAX=M_MAX, TOPK=TOPK, SH_T=SH_T)
     return launch
