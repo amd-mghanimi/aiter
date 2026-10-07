@@ -776,9 +776,9 @@ def compile_routed_chain(
     G1_KSTAGES=0,
     G1_BN_WIDE=0,
     G1_WIDE_MB=96,
-    SORT_DISTINCT=False,
-    RANK_SPLIT=False,
-    CAND_BALLOT=False,
+    SORT_DISTINCT=True,
+    RANK_SPLIT=True,
+    CAND_BALLOT=True,
 ):
     """Compile the fused chain; returns the launcher.
 
