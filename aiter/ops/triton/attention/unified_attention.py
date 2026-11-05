@@ -163,7 +163,9 @@ def _gfx950_split_grid(params: _UAParams):
     """Decode, and batches too small to fill the GPU, take the split grid."""
     if params.all_decode:
         return True
-    if params.sliding_window > 0:
+    if params.sliding_window > 0 and (
+        params.max_seqlen_q * params.num_queries_per_kv > 128
+    ):
         return False
     # unsplit, the 2d grid is faster
     config = get_unified_attention_config(
@@ -755,6 +757,7 @@ def _reduce_segments_triton(
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         TILE_SIZE=TILE_SIZE,
         BLOCK_Q=None,
+        ALL_SEGMENTS=params.sliding_window > 0,
         **config,
         enable_fp_fusion=True,
     )

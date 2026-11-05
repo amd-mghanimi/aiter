@@ -185,7 +185,10 @@ def compute_segment_params(config: dict, params) -> dict:
     # tokens one segment must cover, so the split never outruns the context
     tile = triton.next_power_of_2(params.block_size)
     tile = max(tile_lo, tile if tile_hi is None else min(tile_hi, tile))
-    limit = triton.cdiv(params.max_seqlen_k, tile)
+    keys = params.max_seqlen_k
+    if getattr(params, "sliding_window", 0) > 0:
+        keys = min(keys, params.sliding_window + params.max_seqlen_q)
+    limit = triton.cdiv(keys, tile)
     if cap is not None:
         limit = min(cap, limit)
 

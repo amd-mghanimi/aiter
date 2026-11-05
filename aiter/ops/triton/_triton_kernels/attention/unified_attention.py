@@ -1009,6 +1009,7 @@ def reduce_segments(
     FP8_MAX: tl.constexpr = float8_info.max,
     SEGMENT_BLOCK: tl.constexpr = 0,  # segments per merge step, 0 = all at once
     BLOCK_D: tl.constexpr = 0,  # head-dim slice per program (grid axis 2), 0 = all
+    ALL_SEGMENTS: tl.constexpr = False,
 ):
     query_token_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
@@ -1030,6 +1031,8 @@ def reduce_segments(
 
     # create masks for subsequent loads
     act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
+    if ALL_SEGMENTS:
+        act_num_segments = NUM_SEGMENTS_PER_SEQ
     single_tile: tl.constexpr = (
         SEGMENT_BLOCK == 0 or SEGMENT_BLOCK >= NUM_SEGMENTS_PER_SEQ
     )

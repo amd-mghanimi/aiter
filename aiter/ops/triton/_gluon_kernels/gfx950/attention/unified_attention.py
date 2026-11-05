@@ -1203,14 +1203,21 @@ class AttentionProgram:
             query_mask_qk = gl.convert_layout(query_mask, cfg.qk_layout)
 
         # Split-KV: carve the sequence as reduce_segments does, so every query
-        # block of a sequence agrees on the split boundaries
+        # block of a sequence agrees on the split boundaries. A window carves
+        # its own tiles instead, and reduce_segments then merges every split.
         if NUM_SPLITS > 1:
-            split_len = NUM_SPLITS * cfg.TILE_SIZE
-            seq_len = context_len + cur_batch_query_len
-            tiles_per_split = (seq_len + split_len - 1) // split_len
-            split_start = split_idx * tiles_per_split
-            tile_end = gl.minimum(split_start + tiles_per_split, tile_end)
-            tile_start = gl.maximum(split_start, tile_start)
+            if cfg.SLIDING_WINDOW > 0:
+                tiles_per_split = (tile_end - tile_start + NUM_SPLITS - 1) // NUM_SPLITS
+                split_start = tile_start + split_idx * tiles_per_split
+                tile_end = gl.minimum(split_start + tiles_per_split, tile_end)
+                tile_start = split_start
+            else:
+                split_len = NUM_SPLITS * cfg.TILE_SIZE
+                seq_len = context_len + cur_batch_query_len
+                tiles_per_split = (seq_len + split_len - 1) // split_len
+                split_start = split_idx * tiles_per_split
+                tile_end = gl.minimum(split_start + tiles_per_split, tile_end)
+                tile_start = gl.maximum(split_start, tile_start)
 
         safe_tile_end = gl.minimum(safe_tile_end, tile_end - 1)
         safe_tile_end = gl.maximum(safe_tile_end, tile_start)
@@ -1909,7 +1916,7 @@ def _unified_attention_gluon_kernel(
 
     if NUM_SPLITS > 1 and pgm.tile_start >= pgm.tile_end:
         # past this block's causal edge, but reduce_segments still reads it
-        if pgm.tile_start * TILE_SIZE < seq_len:
+        if (pgm.tile_start * TILE_SIZE < seq_len) | (SLIDING_WINDOW > 0):
             empty = gl.zeros(
                 [BLOCK_M], dtype=gl.float32, layout=gl.SliceLayout(1, cfg.pv_layout)
             )
