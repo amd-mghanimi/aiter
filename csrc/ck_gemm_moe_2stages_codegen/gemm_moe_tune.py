@@ -3,6 +3,7 @@
 
 import argparse
 import functools
+import itertools
 import math
 import os
 import re
@@ -95,6 +96,11 @@ from aiter.ops.shuffle import (
     shuffle_scale_for_int4,
     shuffle_weight,
     shuffle_weight_a16w4,
+)
+from aiter.ops.triton.moe.fused_moe_a16w16 import (
+    fused_moe_a16w16_stage1,
+    fused_moe_a16w16_stage2,
+    triton_a16w16_kernel_name,
 )
 from aiter.utility import fp4_utils
 from aiter.utility.base_tuner import TunerCommon
@@ -688,6 +694,28 @@ _GEN_DATA_1STAGE_KEYS = [
 ]
 
 
+def get_triton_a16w16_kernels(stage: int, block_m: int, n_dim: int, k_dim: int):
+    """Triton a16w16 MoE candidates for one stage at one sorting block_m.
+
+    Stage 1 holds a gate and an up tile, so it needs about twice the LDS of
+    stage 2. Configs over the 160 KiB LDS budget are dropped.
+    """
+    names = []
+    b_tiles = 2 if stage == 1 else 1
+    stages = 2
+    for bn, bk, gm, warps, we in itertools.product(
+        (64, 128, 256), (64, 128), (1, 8), (4, 8), (0, 2)
+    ):
+        if n_dim % bn or k_dim % bk:
+            continue
+        if stages * (block_m + b_tiles * bn) * bk * 2 > 160 * 1024:
+            continue
+        names.append(
+            triton_a16w16_kernel_name(stage, block_m, bn, bk, gm, warps, stages, we)
+        )
+    return names
+
+
 class FmoeTuner(TunerCommon):
     SUPPORTS_FAST_SCAN = False
     SUPPORTS_POWER_SELECT = True
@@ -1209,6 +1237,68 @@ class FmoeTuner(TunerCommon):
             b_nt=kparams.get("b_nt", 0),
             xcd_swizzle=kparams.get("xcd_swizzle", 0),
             bias=bias,
+        )
+
+    @staticmethod
+    def run_triton_a16w16_stage1_out(
+        a1_qt,
+        w1_qt_shffle_ck,
+        sorted_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        dtype,
+        topk,
+        kernelName,
+        blockM,
+    ):
+        out = torch.empty(
+            (a1_qt.shape[0], topk, w1_qt_shffle_ck.shape[1] // 2),
+            dtype=dtype,
+            device=a1_qt.device,
+        )
+        return fused_moe_a16w16_stage1(
+            a1_qt,
+            w1_qt_shffle_ck,
+            sorted_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            out,
+            topk,
+            blockM,
+            kernelName,
+            shuffled=True,
+        )
+
+    @staticmethod
+    def run_triton_a16w16_stage2_out(
+        a2_qt,
+        w2_qt_shffle_ck,
+        sorted_ids,
+        sorted_expert_ids,
+        sorted_weights,
+        num_valid_ids,
+        dtype,
+        topk,
+        kernelName,
+        blockM,
+    ):
+        out = torch.zeros(
+            (a2_qt.shape[0], w2_qt_shffle_ck.shape[1]),
+            dtype=dtype,
+            device=a2_qt.device,
+        )
+        return fused_moe_a16w16_stage2(
+            a2_qt,
+            w2_qt_shffle_ck,
+            sorted_ids,
+            sorted_expert_ids,
+            sorted_weights,
+            num_valid_ids,
+            out,
+            topk,
+            blockM,
+            kernelName,
+            shuffled=True,
         )
 
     @staticmethod
@@ -4234,6 +4324,150 @@ class FmoeTuner(TunerCommon):
 
         return tasks_flydsl
 
+    def gen_triton_a16w16_2stages_task(self, info, blockMs):
+        """BF16 x BF16 Triton stages; they share CK's unsorted intermediate,
+        so post_process pairs them with CK 2-stage rows at the same block_m."""
+        tasks = []
+        (
+            _gfx,
+            _cu_num,
+            token,
+            model_dim,
+            inter_dim,
+            expert,
+            topk,
+            act_type,
+            dtype,
+            q_dtype_a,
+            q_dtype_w,
+            q_type,
+            use_g1u1,
+            doweight_stage1,
+        ) = info
+        if not (
+            q_type == QuantType.No
+            and dtype in (dtypes.bf16, dtypes.fp16)
+            and q_dtype_a == dtype
+            and q_dtype_w == dtype
+            and act_type == ActivationType.Silu
+            and use_g1u1
+            and not doweight_stage1
+        ):
+            return tasks
+        data_args = (
+            token,
+            model_dim,
+            inter_dim,
+            expert,
+            topk,
+            act_type,
+            dtype,
+            q_dtype_a,
+            q_dtype_w,
+            q_type,
+            use_g1u1,
+            doweight_stage1,
+        )
+        s1_ref_args = (
+            [
+                "a1_qt",
+                "w1_qt",
+                "w2_qt",
+                "topk_weights",
+                "topk_ids",
+                "a1_scale",
+                "w1_scale",
+                "sorted_ids",
+                "num_valid_ids",
+                "bias",
+            ],
+            dtype,
+            act_type,
+            q_type,
+            doweight_stage1,
+            topk,
+        )
+        s2_ref_args = (
+            [
+                "a2_qt",
+                "w1_qt",
+                "w2_qt",
+                "topk_weights",
+                "topk_ids",
+                "a2_scale",
+                "w2_scale",
+                "bias",
+            ],
+            dtype,
+            q_type,
+            doweight_stage1,
+        )
+        for blockM in blockMs:
+            if blockM not in (16, 32, 64, 128):
+                continue
+            for kname in get_triton_a16w16_kernels(1, blockM, inter_dim, model_dim):
+                tasks.append(
+                    (
+                        (info, "stage1", kname, blockM),
+                        FmoeTuner.generate_data_2stages,
+                        (*data_args, blockM, 1),
+                        FmoeTuner.run_triton_a16w16_stage1_out,
+                        (
+                            [
+                                "a1_qt",
+                                "w1_qt_shffle_ck",
+                                "sorted_ids",
+                                "sorted_expert_ids",
+                                "num_valid_ids",
+                            ],
+                            dtype,
+                            topk,
+                            kname,
+                            blockM,
+                        ),
+                        {},
+                        FmoeTuner.run_torch_moe_stage1,
+                        (*s1_ref_args, blockM),
+                        {},
+                        None,
+                        0.01,
+                        0.01,
+                        None,
+                    )
+                )
+            for kname in get_triton_a16w16_kernels(2, blockM, model_dim, inter_dim):
+                tasks.append(
+                    (
+                        (info, "stage2", kname, blockM),
+                        FmoeTuner.generate_data_2stages,
+                        (*data_args, blockM, 2),
+                        FmoeTuner.run_triton_a16w16_stage2_out,
+                        (
+                            [
+                                "a2_qt",
+                                "w2_qt_shffle_ck",
+                                "sorted_ids",
+                                "sorted_expert_ids",
+                                "sorted_weights",
+                                "num_valid_ids",
+                            ],
+                            dtype,
+                            topk,
+                            kname,
+                            blockM,
+                        ),
+                        {},
+                        FmoeTuner.run_torch_moe_stage2,
+                        s2_ref_args,
+                        {},
+                        None,
+                        0.01,
+                        0.01,
+                        None,
+                    )
+                )
+        return tasks
+
     def gen_flydsl_v2_2stages_task(self, info, blockMs):
         tasks = []
         (
@@ -5450,6 +5684,8 @@ class FmoeTuner(TunerCommon):
                 )
             if _want("flydsli4"):
                 tasks_ck.extend(self.gen_flydsl_i4_2stages_task(info, blockMs))
+            if _want("triton"):
+                tasks_ck.extend(self.gen_triton_a16w16_2stages_task(info, blockMs))
             if _want("opus"):
                 tasks_ck.extend(
                     self.gen_opus_2stages_task(
