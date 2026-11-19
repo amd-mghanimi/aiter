@@ -61,6 +61,14 @@ try:
 except:  # noqa: E722
     _unified_attention_kernel_gfx950 = None
 
+# gfx942
+try:
+    from aiter.ops.triton._gluon_kernels.gfx942.attention.unified_attention import (
+        _unified_attention_gluon_kernel as _unified_attention_kernel_gfx942,
+    )
+except:  # noqa: E722
+    _unified_attention_kernel_gfx942 = None
+
 # Max NUM_SEGMENTS the gluon reduce holds in-thread; larger split counts fall back to the Triton reduce_segments.
 _GLUON_REDUCE_MAX_SEGMENTS = 8
 # gfx1250, short queries (speculative-decode verify, q_len = 1 + num_spec): the 3D
@@ -142,6 +150,13 @@ _GFX950_LDS_BUDGET = 160 * 1024
 
 def _is_gluon_available():
     return any(supported in DEVICE_ARCH for supported in _GLUON_SUPPORTED_ARCHS)
+
+
+# gfx942 gluon kernel: one query block of 16 rows (8 queries per KV head, q <= 2),
+# one 64-token tile over 16-token pages, one warp.
+_GFX942_BLOCK_M = 16
+_GFX942_TILE_SIZE = 64
+_GFX942_MFMA_DIM = 16
 
 
 def _split_launch_config(config):
@@ -489,8 +504,9 @@ def unified_attention(
         "gluon",
     ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
     if backend == "gluon":
+        # gfx942 takes the gluon backend for one shape only (_gfx942_gluon_supported).
         assert (
-            _is_gluon_available()
+            _is_gluon_available() or DEVICE_ARCH == "gfx942"
         ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
 
     use_alibi_slopes = alibi_slopes is not None
@@ -657,6 +673,15 @@ def unified_attention(
         skip_reduce=skip_reduce,
         force_fp8_pv_on_fp4_kv_cache=force_fp8_pv_on_fp4_kv_cache,
     )
+
+    if DEVICE_ARCH == "gfx942" and backend == "gluon":
+        assert not epilogue and _gfx942_gluon_supported(params), (
+            "gfx942 gluon backend runs only head 64, bf16 q/kv/out, 16-token pages, "
+            "8 queries per KV head with max_seqlen_q 2, no window, sinks, softcap, "
+            "alibi, qq_bias, scales, shuffled cache or output epilogue"
+        )
+        _unified_attention_gfx942(params)
+        return final_out
 
     # if batch contains a prefill
     if use_2d_kernel(params, backend):
@@ -1803,4 +1828,106 @@ def _unified_attention_3d_gfx950(
         partial_acc=segm_output if split else None,
         partial_m=segm_max if split else None,
         partial_l=segm_expsum if split else None,
+    )
+
+
+def _gfx942_gluon_supported(params: _UAParams):
+    """The one shape the gfx942 gluon kernel takes: a single 16-row query block
+    (8 queries per KV head, max_seqlen_q 2), head 64, bf16, 16-token pages."""
+    return (
+        DEVICE_ARCH == "gfx942"
+        and _unified_attention_kernel_gfx942 is not None
+        and params.head_size == 64
+        and params.head_size_v == 64
+        and params.q_dtype == torch.bfloat16
+        and params.kv_cache_dtype == torch.bfloat16
+        and params.v_cache_dtype == torch.bfloat16
+        and params.out.dtype == torch.bfloat16
+        and params.block_size == 16
+        and params.num_queries_per_kv == 8
+        and int(params.max_seqlen_q) == 2
+        and params.causal
+        and params.sliding_window == 0
+        and params.sinks is None
+        and not params.softcap
+        and not params.use_alibi_slopes
+        and not params.use_qq_bias
+        and not params.shuffled_kv_cache
+        and params.q_scales is None
+        and params.q_descale is None
+        and params.k_descale is None
+        and params.v_descale is None
+        and params.output_scale is None
+        and not params.skip_reduce
+    )
+
+
+def _unified_attention_gfx942(params: _UAParams):
+    """One program per (kv head, sequence): every sequence fits the one query block."""
+    BLOCK_M = _GFX942_BLOCK_M
+    BLOCK_Q = BLOCK_M // params.num_queries_per_kv
+    assert int(params.max_seqlen_q) <= BLOCK_Q
+    grid = (params.num_kv_heads, params.num_seqs)
+
+    MAX_INT32 = 2**31 - 1
+    USE_LOAD_BUFFER_OP = (
+        max(max_addressable_bytes(params.k), max_addressable_bytes(params.v))
+        <= MAX_INT32
+    )
+    USE_STORE_BUFFER_OP = params.out.nelement() * params.out.element_size() <= MAX_INT32
+
+    _unified_attention_kernel_gfx942[grid](
+        query_ptr=params.q,
+        key_cache_ptr=params.k,
+        value_cache_ptr=params.v,
+        sink_ptr=None,
+        output_ptr=params.out,
+        block_tables_ptr=params.block_table,
+        seq_lens_ptr=params.seqused_k,
+        query_start_len_ptr=params.cu_seqlens_q,
+        query_stride_0=params.q.stride(0),
+        query_stride_1=params.q.stride(1),
+        output_stride_0=params.out.stride(0),
+        output_stride_1=params.out.stride(1),
+        k_descale_ptr=None,
+        v_descale_ptr=None,
+        q_descale_ptr=None,
+        out_scale_ptr=None,
+        USE_SINKS=False,
+        SLIDING_WINDOW=0,
+        num_blocks=params.num_blocks,
+        stride_k_cache_0=params.k.stride(0),
+        stride_k_cache_1=params.k.stride(1),
+        stride_k_cache_2=params.k.stride(2),
+        stride_k_cache_3=params.k.stride(3),
+        stride_v_cache_0=params.v.stride(0),
+        stride_v_cache_1=params.v.stride(1),
+        stride_v_cache_2=params.v.stride(2),
+        stride_v_cache_3=params.v.stride(3),
+        block_table_stride=params.block_table.stride(0),
+        num_seqs=params.num_seqs,
+        SCALE=params.softmax_scale,
+        SOFTCAP=0.0,
+        USE_SOFTCAP=False,
+        NUM_QUERY_HEADS=params.num_query_heads,
+        NUM_KV_HEADS=params.num_kv_heads,
+        BLOCK_SIZE=params.block_size,
+        TILE_SIZE=_GFX942_TILE_SIZE,
+        HEAD_SIZE=params.head_size,
+        BLOCK_Q=BLOCK_Q,
+        BLOCK_M=BLOCK_M,
+        MFMA_DIM=_GFX942_MFMA_DIM,
+        ARCH_NAME=DEVICE_ARCH,
+        USE_LOAD_BUFFER_OP=USE_LOAD_BUFFER_OP,
+        USE_STORE_BUFFER_OP=USE_STORE_BUFFER_OP,
+        num_warps=BLOCK_M // _GFX942_MFMA_DIM,
+        ALL_DECODE=False,
+        ONE_Q_BLOCK=True,
+        CAUSAL=True,
+        REMOVE_INDIRECT_ACCESS=False,
+        NUM_BUFFERS=1,
+        SHUFFLED_KV_CACHE=False,
+        KV_SHUFFLE_WIDTH=0,
+        NUM_SPLITS=1,
+        enable_fp_fusion=True,
     )
