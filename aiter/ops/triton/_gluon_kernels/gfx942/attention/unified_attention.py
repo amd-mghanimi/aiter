@@ -199,8 +199,7 @@ def _padded_kv_layouts(HEAD_SIZE, TILE_SIZE, NUM_WARPS, C, WARP_SIZE, FP8_KV):
 
 @gluon.constexpr_function
 def _legacy_kv_layouts(HEAD_SIZE, NUM_WARPS, C, WARP_SIZE, FP8_KV):
-    """Fallback for a triton whose async_copy will not take a linear load layout:
-    plain blocked loads over XOR-swizzled shared memory."""
+    """Fallback for triton < 3.7: plain blocked loads over XOR-swizzled shared memory."""
     HEAD_SIZE_DIV = HEAD_SIZE // C
     blocked_v = gl.BlockedLayout(
         size_per_thread=[1, C],
@@ -231,7 +230,7 @@ def _make_kv_load_layouts(
     SHUFFLED=False,
     GATHER=False,
 ):
-    """Load and shared layouts for CDNA4 async KV cache loading, as
+    """Load and shared layouts for KV cache loading (registers, then shared), as
     (blocked_k, blocked_v, shared_k, shared_v).
 
     Three paths:
@@ -450,8 +449,8 @@ class AttentionConfig:
 @aggregate
 @strip_annotate
 class AsyncKVLoaderConfig:
-    """Derived blocked / shared-memory layouts for the async KV load path.
-    Only tuned for CDNA4. 2D (HEAD_SIZE, TILE_SIZE) / (TILE_SIZE, HEAD_SIZE)
+    """Derived blocked / shared-memory layouts for the KV load path.
+    Layouts were tuned for CDNA4. 2D (HEAD_SIZE, TILE_SIZE) / (TILE_SIZE, HEAD_SIZE)
     tile layouts from _make_kv_load_layouts.
     """
 
@@ -621,39 +620,34 @@ class AsyncKVLoader:
 
     @gluon.jit
     def load_k_to_shared(self, k_offset, buffer_id=0):
-        # Async copy K tile from global to shared memory
+        # CDNA3 has no direct-to-LDS copy: load K into registers, then store to shared
         if self.cfg.USE_LOAD_BUFFER_OP:
-            gl.amd.cdna4.async_copy.buffer_load_to_shared(
-                self.k_shared.index(buffer_id),
-                self.key_cache_ptr,
-                self.k_base_offset + k_offset,
-                cache_modifier=self.cfg.KV_CACHE_MODIFIER,
+            k = gl.amd.cdna3.buffer_load(
+                ptr=self.key_cache_ptr,
+                offsets=self.k_base_offset + k_offset,
+                cache=self.cfg.KV_CACHE_MODIFIER,
             )
         else:
-            gl.amd.cdna4.async_copy.global_load_to_shared(
-                self.k_shared.index(buffer_id),
+            k = gl.load(
                 self.key_cache_ptr + self.k_base_offset + k_offset,
                 cache_modifier=self.cfg.KV_CACHE_MODIFIER,
             )
-        gl.amd.cdna4.async_copy.commit_group()
+        self.k_shared.index(buffer_id).store(k)
 
     @gluon.jit
     def load_v_to_shared(self, v_offset, buffer_id=0):
-        # Async copy V tile from global to shared memory
         if self.cfg.USE_LOAD_BUFFER_OP:
-            gl.amd.cdna4.async_copy.buffer_load_to_shared(
-                self.v_shared.index(buffer_id),
-                self.value_cache_ptr,
-                self.v_base_offset + v_offset,
-                cache_modifier=self.cfg.KV_CACHE_MODIFIER,
+            v = gl.amd.cdna3.buffer_load(
+                ptr=self.value_cache_ptr,
+                offsets=self.v_base_offset + v_offset,
+                cache=self.cfg.KV_CACHE_MODIFIER,
             )
         else:
-            gl.amd.cdna4.async_copy.global_load_to_shared(
-                self.v_shared.index(buffer_id),
+            v = gl.load(
                 self.value_cache_ptr + self.v_base_offset + v_offset,
                 cache_modifier=self.cfg.KV_CACHE_MODIFIER,
             )
-        gl.amd.cdna4.async_copy.commit_group()
+        self.v_shared.index(buffer_id).store(v)
 
     @gluon.jit
     def k_tile(self, buffer_id):
@@ -684,45 +678,13 @@ class AsyncKVLoader:
             return self.v_shared.index(buffer_id)
 
     @gluon.jit
-    def load_k_from_shared(
-        self,
-        wait_count,
-        target_dtype,
-        buffer_id=0,
-        skip_wait: gl.constexpr = False,
-        RELAXED: gl.constexpr = False,
-    ):
-        # Wait for async K copy and load from shared memory
-        if not skip_wait:
-            gl.amd.cdna4.async_copy.wait_group(wait_count)
-        # keep the partial vmcnt that a plain .load() widens to vmcnt(0)
-        if self.cfg.NUM_WARPS == 1 or RELAXED:
-            raw = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                self.k_tile(buffer_id), self.cfg.k_layout
-            )
-        else:
-            raw = self.k_tile(buffer_id).load(layout=self.cfg.k_layout)
+    def load_k_from_shared(self, target_dtype, buffer_id=0):
+        raw = self.k_tile(buffer_id).load(layout=self.cfg.k_layout)
         return raw.to(target_dtype)
 
     @gluon.jit
-    def load_v_from_shared(
-        self,
-        wait_count,
-        target_dtype,
-        buffer_id=0,
-        skip_wait: gl.constexpr = False,
-        RELAXED: gl.constexpr = False,
-    ):
-        # Wait for async V copy and load from shared memory
-        if not skip_wait:
-            gl.amd.cdna4.async_copy.wait_group(wait_count)
-        # keep the partial vmcnt that a plain .load() widens to vmcnt(0)
-        if self.cfg.NUM_WARPS == 1 or RELAXED:
-            raw = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                self.v_tile(buffer_id), self.cfg.v_layout
-            )
-        else:
-            raw = self.v_tile(buffer_id).load(layout=self.cfg.v_layout)
+    def load_v_from_shared(self, target_dtype, buffer_id=0):
+        raw = self.v_tile(buffer_id).load(layout=self.cfg.v_layout)
         return raw.to(target_dtype)
 
     @gluon.jit
@@ -941,76 +903,42 @@ class AsyncGatherKVLoader:
         # load_block_ids returns the (k, v) offset pair
         k_offset_tensor = k_offset[0]
         if self.cfg.USE_LOAD_BUFFER_OP:
-            gl.amd.cdna4.async_copy.buffer_load_to_shared(
-                self.k_shared.index(buffer_id),
-                self.key_cache_ptr,
-                k_offset_tensor,
-                cache_modifier=self.cfg.KV_CACHE_MODIFIER,
+            k = gl.amd.cdna3.buffer_load(
+                ptr=self.key_cache_ptr,
+                offsets=k_offset_tensor,
+                cache=self.cfg.KV_CACHE_MODIFIER,
             )
         else:
-            gl.amd.cdna4.async_copy.global_load_to_shared(
-                self.k_shared.index(buffer_id),
+            k = gl.load(
                 self.key_cache_ptr + k_offset_tensor,
                 cache_modifier=self.cfg.KV_CACHE_MODIFIER,
             )
-        gl.amd.cdna4.async_copy.commit_group()
+        self.k_shared.index(buffer_id).store(k)
 
     @gluon.jit
     def load_v_to_shared(self, v_offset, buffer_id=0):
         v_offset_tensor = v_offset[1]
         if self.cfg.USE_LOAD_BUFFER_OP:
-            gl.amd.cdna4.async_copy.buffer_load_to_shared(
-                self.v_shared.index(buffer_id),
-                self.value_cache_ptr,
-                v_offset_tensor,
-                cache_modifier=self.cfg.KV_CACHE_MODIFIER,
+            v = gl.amd.cdna3.buffer_load(
+                ptr=self.value_cache_ptr,
+                offsets=v_offset_tensor,
+                cache=self.cfg.KV_CACHE_MODIFIER,
             )
         else:
-            gl.amd.cdna4.async_copy.global_load_to_shared(
-                self.v_shared.index(buffer_id),
+            v = gl.load(
                 self.value_cache_ptr + v_offset_tensor,
                 cache_modifier=self.cfg.KV_CACHE_MODIFIER,
             )
-        gl.amd.cdna4.async_copy.commit_group()
+        self.v_shared.index(buffer_id).store(v)
 
     @gluon.jit
-    def load_k_from_shared(
-        self,
-        wait_count,
-        target_dtype,
-        buffer_id=0,
-        skip_wait: gl.constexpr = False,
-        RELAXED: gl.constexpr = False,
-    ):
-        if not skip_wait:
-            gl.amd.cdna4.async_copy.wait_group(wait_count)
-        # keep the partial vmcnt that a plain .load() widens to vmcnt(0)
-        if self.cfg.NUM_WARPS == 1 or RELAXED:
-            raw = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                self.k_tile(buffer_id), self.cfg.k_layout
-            )
-        else:
-            raw = self.k_tile(buffer_id).load(layout=self.cfg.k_layout)
+    def load_k_from_shared(self, target_dtype, buffer_id=0):
+        raw = self.k_tile(buffer_id).load(layout=self.cfg.k_layout)
         return raw.to(target_dtype)
 
     @gluon.jit
-    def load_v_from_shared(
-        self,
-        wait_count,
-        target_dtype,
-        buffer_id=0,
-        skip_wait: gl.constexpr = False,
-        RELAXED: gl.constexpr = False,
-    ):
-        if not skip_wait:
-            gl.amd.cdna4.async_copy.wait_group(wait_count)
-        # keep the partial vmcnt that a plain .load() widens to vmcnt(0)
-        if self.cfg.NUM_WARPS == 1 or RELAXED:
-            raw = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                self.v_tile(buffer_id), self.cfg.v_layout
-            )
-        else:
-            raw = self.v_tile(buffer_id).load(layout=self.cfg.v_layout)
+    def load_v_from_shared(self, target_dtype, buffer_id=0):
+        raw = self.v_tile(buffer_id).load(layout=self.cfg.v_layout)
         return raw.to(target_dtype)
 
     @gluon.jit
@@ -1437,29 +1365,21 @@ class AttentionProgram:
 @gluon.jit
 def attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc):
     # One shared buffer, and every warp reads the whole tile because operand B is
-    # replicated across warps
-    # barriers are needed for correctness but I expect compiler to insert them automatically.
-    # Not sure why that doesnt happen
+    # replicated across warps. The K/V stores to shared are synchronous, so a
+    # barrier after the store and one before the next tile's store are enough.
     for j in range(pgm.tile_start, pgm.safe_tile_end):
         blk = kv_loader.load_block_ids(j)
         kv_loader.load_k_to_shared(blk, buffer_id=0)
         kv_loader.load_v_to_shared(blk, buffer_id=0)
-        gl.amd.cdna4.async_copy.wait_group(1)
         _barrier()
-        k = kv_loader.load_k_from_shared(
-            wait_count=1, target_dtype=q.dtype, buffer_id=0, skip_wait=True
-        )
+        k = kv_loader.load_k_from_shared(target_dtype=q.dtype, buffer_id=0)
         S = pgm.compute_qk(k)
         if pgm.cfg.SLIDING_WINDOW > 0:
             S = pgm.apply_mask_qk(S, j)
         S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
         p, alpha, M = pgm.softmax_part0(S, M)
         p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=q.dtype)
-        gl.amd.cdna4.async_copy.wait_group(0)
-        _barrier()
-        v = kv_loader.load_v_from_shared(
-            wait_count=0, target_dtype=q.dtype, buffer_id=0, skip_wait=True
-        )
+        v = kv_loader.load_v_from_shared(target_dtype=q.dtype, buffer_id=0)
         acc = pgm.compute_pv(p, v, acc)
         _barrier()
 
@@ -1468,21 +1388,14 @@ def attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc):
             blk = kv_loader.load_block_ids(j)
             kv_loader.load_k_to_shared(blk, buffer_id=0)
             kv_loader.load_v_to_shared(blk, buffer_id=0)
-            gl.amd.cdna4.async_copy.wait_group(1)
             _barrier()
-            k = kv_loader.load_k_from_shared(
-                wait_count=1, target_dtype=q.dtype, buffer_id=0, skip_wait=True
-            )
+            k = kv_loader.load_k_from_shared(target_dtype=q.dtype, buffer_id=0)
             S = pgm.compute_qk(k)
             S = pgm.apply_mask_qk(S, j)
             S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
             p, alpha, M = pgm.softmax_part0(S, M)
             p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=q.dtype)
-            gl.amd.cdna4.async_copy.wait_group(0)
-            _barrier()
-            v = kv_loader.load_v_from_shared(
-                wait_count=0, target_dtype=q.dtype, buffer_id=0, skip_wait=True
-            )
+            v = kv_loader.load_v_from_shared(target_dtype=q.dtype, buffer_id=0)
             acc = pgm.compute_pv(p, v, acc)
             _barrier()
 
@@ -1491,21 +1404,14 @@ def attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc):
     blk = kv_loader.load_block_ids(j)
     kv_loader.load_k_to_shared(blk, buffer_id=0)
     kv_loader.load_v_to_shared(blk, buffer_id=0)
-    gl.amd.cdna4.async_copy.wait_group(1)
     _barrier()
-    k = kv_loader.load_k_from_shared(
-        wait_count=1, target_dtype=q.dtype, buffer_id=0, skip_wait=True
-    )
+    k = kv_loader.load_k_from_shared(target_dtype=q.dtype, buffer_id=0)
     S = pgm.compute_qk(k)
     S = pgm.apply_mask_qk(S, j)
     S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
     p, alpha, M = pgm.softmax_part0(S, M)
     p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=q.dtype)
-    gl.amd.cdna4.async_copy.wait_group(0)
-    _barrier()
-    v = kv_loader.load_v_from_shared(
-        wait_count=0, target_dtype=q.dtype, buffer_id=0, skip_wait=True
-    )
+    v = kv_loader.load_v_from_shared(target_dtype=q.dtype, buffer_id=0)
     acc = pgm.compute_pv(p, v, acc)
     return M, L, acc
 
@@ -1525,26 +1431,9 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
     kv_loader.load_v_to_shared(physical_block_idx, buffer_id=buffer_id)
     # ---- Safe tiles (no mask) ----
     for j in range(pgm.tile_start, pgm.safe_tile_end):
-        if pgm.cfg.NUM_WARPS == 1:
-            next2_physical_block_idx = kv_loader.load_block_ids(j + 2)
-            k = kv_loader.load_k_from_shared(
-                wait_count=1, target_dtype=q.dtype, buffer_id=buffer_id
-            )
-        else:
-            # Manually inserting barriers to compansate for the relaxed loads
-            # Also merged waits to have fewer barriers.
-            # this leads to better code-gen
-            gl.amd.cdna4.async_copy.wait_group(0)
-            _barrier()
-            # below the drain, or vmcnt(0) waits on this load too
-            next2_physical_block_idx = kv_loader.load_block_ids(j + 2)
-            k = kv_loader.load_k_from_shared(
-                wait_count=0,
-                target_dtype=q.dtype,
-                buffer_id=buffer_id,
-                skip_wait=True,
-                RELAXED=True,
-            )
+        _barrier()
+        next2_physical_block_idx = kv_loader.load_block_ids(j + 2)
+        k = kv_loader.load_k_from_shared(target_dtype=q.dtype, buffer_id=buffer_id)
         kv_loader.load_k_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
         kv_loader.load_v_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
 
@@ -1555,42 +1444,16 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
         p, alpha, M = pgm.softmax_part0(S, M)
         p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=q.dtype)
 
-        if pgm.cfg.NUM_WARPS == 1:
-            v = kv_loader.load_v_from_shared(
-                wait_count=2, target_dtype=q.dtype, buffer_id=buffer_id
-            )
-        else:
-            # ordered by the wait at the top of the iteration
-            v = kv_loader.load_v_from_shared(
-                wait_count=0,
-                target_dtype=q.dtype,
-                buffer_id=buffer_id,
-                skip_wait=True,
-                RELAXED=True,
-            )
+        v = kv_loader.load_v_from_shared(target_dtype=q.dtype, buffer_id=buffer_id)
         acc = pgm.compute_pv(p, v, acc)
         buffer_id = 1 - buffer_id
         next_physical_block_idx = next2_physical_block_idx
     if not pgm.cfg.ALL_DECODE:
         # ---- Masked tiles (causal boundary) ----
         for j in range(pgm.safe_tile_end, pgm.tile_end - 1):
-            if pgm.cfg.NUM_WARPS == 1:
-                next2_physical_block_idx = kv_loader.load_block_ids(j + 2)
-                k = kv_loader.load_k_from_shared(
-                    wait_count=1, target_dtype=q.dtype, buffer_id=buffer_id
-                )
-            else:
-                # same merged wait as the safe-tile loop
-                gl.amd.cdna4.async_copy.wait_group(0)
-                _barrier()
-                next2_physical_block_idx = kv_loader.load_block_ids(j + 2)
-                k = kv_loader.load_k_from_shared(
-                    wait_count=0,
-                    target_dtype=q.dtype,
-                    buffer_id=buffer_id,
-                    skip_wait=True,
-                    RELAXED=True,
-                )
+            _barrier()
+            next2_physical_block_idx = kv_loader.load_block_ids(j + 2)
+            k = kv_loader.load_k_from_shared(target_dtype=q.dtype, buffer_id=buffer_id)
             kv_loader.load_k_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
             kv_loader.load_v_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
 
@@ -1600,49 +1463,20 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
             p, alpha, M = pgm.softmax_part0(S, M)
             p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
 
-            if pgm.cfg.NUM_WARPS == 1:
-                v = kv_loader.load_v_from_shared(
-                    wait_count=2, target_dtype=q.dtype, buffer_id=buffer_id
-                )
-            else:
-                v = kv_loader.load_v_from_shared(
-                    wait_count=0,
-                    target_dtype=q.dtype,
-                    buffer_id=buffer_id,
-                    skip_wait=True,
-                    RELAXED=True,
-                )
+            v = kv_loader.load_v_from_shared(target_dtype=q.dtype, buffer_id=buffer_id)
             acc = pgm.compute_pv(p, v, acc)
             buffer_id = 1 - buffer_id
             next_physical_block_idx = next2_physical_block_idx
 
     # Last tile is always masked
-    if pgm.cfg.NUM_WARPS > 1:
-        gl.amd.cdna4.async_copy.wait_group(0)
-        _barrier()
-    k = kv_loader.load_k_from_shared(
-        wait_count=1,
-        target_dtype=q.dtype,
-        buffer_id=buffer_id,
-        RELAXED=pgm.cfg.NUM_WARPS > 1,
-    )
+    _barrier()
+    k = kv_loader.load_k_from_shared(target_dtype=q.dtype, buffer_id=buffer_id)
     S = pgm.compute_qk(k)
     S = pgm.apply_mask_qk(S, pgm.tile_end - 1)
     S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
     p, alpha, M = pgm.softmax_part0(S, M)
     p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
-    if pgm.cfg.NUM_WARPS == 1:
-        v = kv_loader.load_v_from_shared(
-            wait_count=0, target_dtype=q.dtype, buffer_id=buffer_id
-        )
-    else:
-        v = kv_loader.load_v_from_shared(
-            wait_count=0,
-            target_dtype=q.dtype,
-            buffer_id=buffer_id,
-            skip_wait=True,
-            RELAXED=True,
-        )
+    v = kv_loader.load_v_from_shared(target_dtype=q.dtype, buffer_id=buffer_id)
     acc = pgm.compute_pv(p, v, acc)
 
     return M, L, acc
@@ -1718,7 +1552,7 @@ def _unified_attention_gluon_kernel(
     FP8_MAX: gl.constexpr = float8_info.max,
     CAUSAL: gl.constexpr = True,
     REMOVE_INDIRECT_ACCESS: gl.constexpr = False,
-    NUM_BUFFERS: gl.constexpr = 2,
+    NUM_BUFFERS: gl.constexpr = 1,
     MFMA_DIM: gl.constexpr = 32,
     USE_SOFTCAP: gl.constexpr = False,
     SHUFFLED_KV_CACHE: gl.constexpr = False,
@@ -1937,6 +1771,7 @@ def _unified_attention_gluon_kernel(
             )
         return
 
+    gl.static_assert(not SHUFFLED_KV_CACHE, "gfx942: shuffled KV cache not supported")
     # TILE_SIZE == BLOCK_SIZE: one page per tile (fast path). Otherwise gather
     if TILE_SIZE == BLOCK_SIZE:
         KVLoader: gl.constexpr = AsyncKVLoader
@@ -1990,9 +1825,7 @@ def _unified_attention_gluon_kernel(
         [BLOCK_M], 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, cfg.pv_layout)
     )
 
-    gl.static_assert(
-        (NUM_BUFFERS == 1) | (NUM_BUFFERS == 2), "NUM_BUFFERS must be 1 or 2"
-    )
+    gl.static_assert(NUM_BUFFERS == 1, "gfx942: NUM_BUFFERS must be 1")
     acc = gl.zeros([BLOCK_M, HEAD_SIZE], dtype=gl.float32, layout=cfg.pv_layout)
     if NUM_BUFFERS == 1:
         M, L, acc = attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc)
