@@ -2573,7 +2573,7 @@ class _TritonLaunchSpy:
         return run
 
 
-def _run_gfx942_one_q_block(seq_lens, num_heads, monkeypatch):
+def _run_gfx942_one_q_block(seq_lens, num_heads, monkeypatch, backend=None):
     query_lens = [q for q, _ in seq_lens]
     kv_lens_list = [kv for _, kv in seq_lens]
     block_size = 16
@@ -2612,6 +2612,14 @@ def _run_gfx942_one_q_block(seq_lens, num_heads, monkeypatch):
         "kernel_unified_attention_3d",
         _TritonLaunchSpy(module.kernel_unified_attention_3d, launches, "3d"),
     )
+    if module._unified_attention_kernel_gfx942 is not None:
+        monkeypatch.setattr(
+            module,
+            "_unified_attention_kernel_gfx942",
+            _TritonLaunchSpy(
+                module._unified_attention_kernel_gfx942, launches, "gluon"
+            ),
+        )
     unified_attention(
         q=query,
         k=key_cache,
@@ -2629,6 +2637,7 @@ def _run_gfx942_one_q_block(seq_lens, num_heads, monkeypatch):
         q_descale=None,
         k_descale=None,
         v_descale=None,
+        backend=backend,
     )
     ref = ref_paged_attn(
         query=query,
@@ -2667,9 +2676,38 @@ def test_triton_unified_attn_gfx942_one_q_block(seq_lens, monkeypatch):
     launches = _run_gfx942_one_q_block(seq_lens, (16, 2), monkeypatch)
     assert launches, "neither Triton kernel launched"
     for name, grid, one_q_block in launches:
+        assert name != "gluon", "the default backend launched the gluon kernel"
         assert one_q_block, f"{name} did not take the one-query-block launch"
         q_blocks = grid[1] if name == "2d" else grid[0]
         assert q_blocks == len(seq_lens), f"{name} {grid}: one block per sequence"
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(2, 2048)],
+        [(2, 300), (1, 1000), (0, 17), (2, 8192)],
+    ],
+)
+@torch.inference_mode()
+def test_gluon_unified_attn_gfx942_one_q_block(seq_lens, monkeypatch):
+    """backend="gluon" on gfx942 sends the one-query-block shape to the gluon kernel:
+    one launch, one query block per sequence, no Triton kernel. A split adds a
+    power-of-two segment count on the third grid axis."""
+    if DEVICE_ARCH != "gfx942":
+        pytest.skip("gfx942 gluon one-query-block launch")
+    launches = _run_gfx942_one_q_block(
+        seq_lens, (16, 2), monkeypatch, backend="gluon"
+    )
+    assert len(launches) == 1, f"expected one gluon launch, got {launches}"
+    name, grid, one_q_block = launches[0]
+    assert name == "gluon" and one_q_block
+    assert grid[:2] == (2, len(seq_lens)), f"gluon {grid}: one block per sequence"
+    if len(grid) == 3:
+        segments = grid[2]
+        assert segments > 1 and segments & (segments - 1) == 0, grid
+    else:
+        assert len(grid) == 2, grid
 
 
 @pytest.mark.parametrize(

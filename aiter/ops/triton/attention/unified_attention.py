@@ -61,6 +61,14 @@ try:
 except:  # noqa: E722
     _unified_attention_kernel_gfx950 = None
 
+# gfx942
+try:
+    from aiter.ops.triton._gluon_kernels.gfx942.attention.unified_attention import (
+        _unified_attention_gluon_kernel as _unified_attention_kernel_gfx942,
+    )
+except:  # noqa: E722
+    _unified_attention_kernel_gfx942 = None
+
 # Max NUM_SEGMENTS the gluon reduce holds in-thread; larger split counts fall back to the Triton reduce_segments.
 _GLUON_REDUCE_MAX_SEGMENTS = 8
 # gfx1250, short queries (speculative-decode verify, q_len = 1 + num_spec): the 3D
@@ -142,6 +150,19 @@ _GFX950_LDS_BUDGET = 160 * 1024
 
 def _is_gluon_available():
     return any(supported in DEVICE_ARCH for supported in _GLUON_SUPPORTED_ARCHS)
+
+
+# gfx942 gluon kernel: one query block of 16-64 rows (8 queries per KV head,
+# q 2-8), 64-token tiles over 16-token pages, one warp per 16 rows.
+_GFX942_BLOCK_M = 16
+_GFX942_MAX_BLOCK_M = 64
+_GFX942_TILE_SIZE = 64
+_GFX942_MFMA_DIM = 16
+# Split-KV grid. Each segment covers at most this many 64-token tiles of the
+# longest context, and the grid is at least one wave per CU. Fit on the
+# head-64 bf16 sweep; see _gfx942_split_segments.
+_GFX942_SPLIT_TILES = 8
+_GFX942_SPLIT_WAVES_PER_CU = 1
 
 
 def _split_launch_config(config):
@@ -489,8 +510,9 @@ def unified_attention(
         "gluon",
     ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
     if backend == "gluon":
+        # gfx942 takes the gluon backend for one shape only (_gfx942_gluon_supported).
         assert (
-            _is_gluon_available()
+            _is_gluon_available() or DEVICE_ARCH == "gfx942"
         ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
 
     use_alibi_slopes = alibi_slopes is not None
@@ -657,6 +679,15 @@ def unified_attention(
         skip_reduce=skip_reduce,
         force_fp8_pv_on_fp4_kv_cache=force_fp8_pv_on_fp4_kv_cache,
     )
+
+    if DEVICE_ARCH == "gfx942" and backend == "gluon":
+        assert not epilogue and _gfx942_gluon_supported(params), (
+            "gfx942 gluon backend runs only head 64, bf16 q/kv/out, 16-token pages, "
+            "8 queries per KV head with max_seqlen_q 2 to 8, no window, sinks, softcap, "
+            "alibi, qq_bias, scales, shuffled cache or output epilogue"
+        )
+        _unified_attention_gfx942(params)
+        return final_out
 
     # if batch contains a prefill
     if use_2d_kernel(params, backend):
@@ -1804,3 +1835,188 @@ def _unified_attention_3d_gfx950(
         partial_m=segm_max if split else None,
         partial_l=segm_expsum if split else None,
     )
+
+
+def _gfx942_gluon_supported(params: _UAParams):
+    """The shapes the gfx942 gluon kernel takes: one query block of at most 64
+    rows per sequence (8 queries per KV head, max_seqlen_q 2 to 8), head 64,
+    bf16, 16-token pages."""
+    return (
+        DEVICE_ARCH == "gfx942"
+        and _unified_attention_kernel_gfx942 is not None
+        and params.head_size == 64
+        and params.head_size_v == 64
+        and params.q_dtype == torch.bfloat16
+        and params.kv_cache_dtype == torch.bfloat16
+        and params.v_cache_dtype == torch.bfloat16
+        and params.out.dtype == torch.bfloat16
+        and params.block_size == 16
+        and params.num_queries_per_kv == 8
+        and 2 <= int(params.max_seqlen_q) <= _GFX942_MAX_BLOCK_M // 8
+        and params.causal
+        and params.sliding_window == 0
+        and params.sinks is None
+        and not params.softcap
+        and not params.use_alibi_slopes
+        and not params.use_qq_bias
+        and not params.shuffled_kv_cache
+        and params.q_scales is None
+        and params.q_descale is None
+        and params.k_descale is None
+        and params.v_descale is None
+        and params.output_scale is None
+        and not params.skip_reduce
+    )
+
+
+def _gfx942_split_segments(params: _UAParams, num_warps: int, tile_size: int) -> int:
+    """KV segments per (kv head, sequence), a power of 2.
+
+    Two lower bounds, then the cap of one segment per tile of the longest
+    context. ``by_work`` keeps a segment to _GFX942_SPLIT_TILES tiles, so a
+    long sequence is split even when the batch is small. ``by_cu`` puts at
+    least _GFX942_SPLIT_WAVES_PER_CU waves on each CU, counting the warps of
+    the query block. Dividing the CU budget by the warp count (the previous
+    rule) undersplit q=4 and q=8 at large batches and oversplit q=2 at batch 8.
+    """
+    limit = triton.cdiv(int(params.max_seqlen_k), tile_size)
+    by_work = triton.cdiv(limit, _GFX942_SPLIT_TILES)
+    waves = params.num_seqs * params.num_kv_heads * num_warps
+    by_cu = triton.cdiv(params.num_sms * _GFX942_SPLIT_WAVES_PER_CU, waves)
+    segments = max(1, min(max(by_work, by_cu), max(limit, 1)))
+    return triton.next_power_of_2(segments)
+
+
+def _unified_attention_gfx942(params: _UAParams):
+    """One program per (kv head, sequence[, KV segment]): every sequence fits
+    the one query block."""
+    BLOCK_M = max(
+        _GFX942_BLOCK_M,
+        triton.next_power_of_2(int(params.max_seqlen_q) * params.num_queries_per_kv),
+    )
+    num_warps = BLOCK_M // _GFX942_MFMA_DIM
+    NUM_SEGMENTS = _gfx942_split_segments(params, num_warps, _GFX942_TILE_SIZE)
+    _launch_gfx942(params, BLOCK_M, _GFX942_TILE_SIZE, NUM_SEGMENTS, num_warps)
+
+
+def _launch_gfx942(
+    params: _UAParams,
+    BLOCK_M: int,
+    TILE_SIZE: int,
+    NUM_SEGMENTS: int,
+    num_warps: int,
+    SPLIT_TILES: int = 0,
+):
+    """The gfx942 gluon launch, unsplit (NUM_SEGMENTS 1) or split-KV with the
+    Triton reduce_segments merging the fp32 partials into params.out.
+
+    SPLIT_TILES > 0 fixes the segment length in tiles (split rebalance); the
+    grid's NUM_SEGMENTS must then cover the longest context."""
+    BLOCK_Q = BLOCK_M // params.num_queries_per_kv
+    assert BLOCK_M <= _GFX942_MAX_BLOCK_M and int(params.max_seqlen_q) <= BLOCK_Q
+    grid = (params.num_kv_heads, params.num_seqs)
+    split = NUM_SEGMENTS > 1
+    if split:
+        grid = grid + (NUM_SEGMENTS,)
+        shape = (params.num_tokens, params.num_query_heads, NUM_SEGMENTS)
+        dev = params.q.device
+        segm_output = torch.empty(
+            shape + (params.head_size_v,), dtype=torch.float32, device=dev
+        )
+        segm_max = torch.empty(shape, dtype=torch.float32, device=dev)
+        segm_expsum = torch.empty(shape, dtype=torch.float32, device=dev)
+
+    MAX_INT32 = 2**31 - 1
+    USE_LOAD_BUFFER_OP = (
+        max(max_addressable_bytes(params.k), max_addressable_bytes(params.v))
+        <= MAX_INT32
+    )
+    USE_STORE_BUFFER_OP = params.out.nelement() * params.out.element_size() <= MAX_INT32
+
+    _unified_attention_kernel_gfx942[grid](
+        query_ptr=params.q,
+        key_cache_ptr=params.k,
+        value_cache_ptr=params.v,
+        sink_ptr=None,
+        output_ptr=params.out,
+        block_tables_ptr=params.block_table,
+        seq_lens_ptr=params.seqused_k,
+        query_start_len_ptr=params.cu_seqlens_q,
+        query_stride_0=params.q.stride(0),
+        query_stride_1=params.q.stride(1),
+        output_stride_0=params.out.stride(0),
+        output_stride_1=params.out.stride(1),
+        k_descale_ptr=None,
+        v_descale_ptr=None,
+        q_descale_ptr=None,
+        out_scale_ptr=None,
+        USE_SINKS=False,
+        SLIDING_WINDOW=0,
+        num_blocks=params.num_blocks,
+        stride_k_cache_0=params.k.stride(0),
+        stride_k_cache_1=params.k.stride(1),
+        stride_k_cache_2=params.k.stride(2),
+        stride_k_cache_3=params.k.stride(3),
+        stride_v_cache_0=params.v.stride(0),
+        stride_v_cache_1=params.v.stride(1),
+        stride_v_cache_2=params.v.stride(2),
+        stride_v_cache_3=params.v.stride(3),
+        block_table_stride=params.block_table.stride(0),
+        num_seqs=params.num_seqs,
+        SCALE=params.softmax_scale,
+        SOFTCAP=0.0,
+        USE_SOFTCAP=False,
+        NUM_QUERY_HEADS=params.num_query_heads,
+        NUM_KV_HEADS=params.num_kv_heads,
+        BLOCK_SIZE=params.block_size,
+        TILE_SIZE=TILE_SIZE,
+        HEAD_SIZE=params.head_size,
+        BLOCK_Q=BLOCK_Q,
+        BLOCK_M=BLOCK_M,
+        MFMA_DIM=_GFX942_MFMA_DIM,
+        ARCH_NAME=DEVICE_ARCH,
+        USE_LOAD_BUFFER_OP=USE_LOAD_BUFFER_OP,
+        USE_STORE_BUFFER_OP=USE_STORE_BUFFER_OP,
+        num_warps=num_warps,
+        ALL_DECODE=False,
+        ONE_Q_BLOCK=True,
+        CAUSAL=True,
+        REMOVE_INDIRECT_ACCESS=False,
+        NUM_BUFFERS=1,
+        SHUFFLED_KV_CACHE=False,
+        KV_SHUFFLE_WIDTH=0,
+        NUM_SPLITS=NUM_SEGMENTS,
+        partial_m_ptr=segm_max if split else None,
+        partial_l_ptr=segm_expsum if split else None,
+        partial_acc_ptr=segm_output if split else None,
+        SPLIT_TILES=SPLIT_TILES if split else 0,
+        enable_fp_fusion=True,
+    )
+    if split:
+        segm_tiles = None
+        reduce_tile = TILE_SIZE
+        if SPLIT_TILES > 0:
+            # reduce_segments counts cdiv(seq_len, segm_tiles * TILE_SIZE)
+            # segments; one "tile" of SPLIT_TILES * TILE_SIZE keys is a segment
+            segm_tiles = _gfx942_one(params.q.device)
+            reduce_tile = SPLIT_TILES * TILE_SIZE
+        _reduce_segments_triton(
+            params,
+            segm_output,
+            segm_max,
+            segm_expsum,
+            NUM_SEGMENTS,
+            reduce_tile,
+            segm_tiles=segm_tiles,
+        )
+
+
+_GFX942_ONE = {}
+
+
+def _gfx942_one(device):
+    """A [1] int32 tensor holding 1, made once per device (outside any graph
+    capture after the first call)."""
+    if device not in _GFX942_ONE:
+        _GFX942_ONE[device] = torch.ones(1, dtype=torch.int32, device=device)
+    return _GFX942_ONE[device]
