@@ -158,8 +158,11 @@ _GFX942_BLOCK_M = 16
 _GFX942_MAX_BLOCK_M = 64
 _GFX942_TILE_SIZE = 64
 _GFX942_MFMA_DIM = 16
-# split-KV grid target, in waves per CU (see _gfx942_split_segments)
-_GFX942_SPLIT_WAVES_PER_CU = 4
+# Split-KV grid. Each segment covers at most this many 64-token tiles of the
+# longest context, and the grid is at least one wave per CU. Fit on the
+# head-64 bf16 sweep; see _gfx942_split_segments.
+_GFX942_SPLIT_TILES = 8
+_GFX942_SPLIT_WAVES_PER_CU = 1
 
 
 def _split_launch_config(config):
@@ -1867,13 +1870,20 @@ def _gfx942_gluon_supported(params: _UAParams):
 
 
 def _gfx942_split_segments(params: _UAParams, num_warps: int, tile_size: int) -> int:
-    """KV segments per (kv head, sequence): enough programs for
-    _GFX942_SPLIT_WAVES_PER_CU waves per CU, a power of 2 (the reduce's segment
-    arange), at most one segment per tile of the longest context."""
-    prgms = params.num_seqs * params.num_kv_heads
-    budget = params.num_sms * _GFX942_SPLIT_WAVES_PER_CU // num_warps
+    """KV segments per (kv head, sequence), a power of 2.
+
+    Two lower bounds, then the cap of one segment per tile of the longest
+    context. ``by_work`` keeps a segment to _GFX942_SPLIT_TILES tiles, so a
+    long sequence is split even when the batch is small. ``by_cu`` puts at
+    least _GFX942_SPLIT_WAVES_PER_CU waves on each CU, counting the warps of
+    the query block. Dividing the CU budget by the warp count (the previous
+    rule) undersplit q=4 and q=8 at large batches and oversplit q=2 at batch 8.
+    """
     limit = triton.cdiv(int(params.max_seqlen_k), tile_size)
-    segments = max(1, min(triton.cdiv(budget, prgms), limit))
+    by_work = triton.cdiv(limit, _GFX942_SPLIT_TILES)
+    waves = params.num_seqs * params.num_kv_heads * num_warps
+    by_cu = triton.cdiv(params.num_sms * _GFX942_SPLIT_WAVES_PER_CU, waves)
+    segments = max(1, min(max(by_work, by_cu), max(limit, 1)))
     return triton.next_power_of_2(segments)
 
 
