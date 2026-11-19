@@ -152,11 +152,14 @@ def _is_gluon_available():
     return any(supported in DEVICE_ARCH for supported in _GLUON_SUPPORTED_ARCHS)
 
 
-# gfx942 gluon kernel: one query block of 16 rows (8 queries per KV head, q <= 2),
-# one 64-token tile over 16-token pages, one warp.
+# gfx942 gluon kernel: one query block of 16-64 rows (8 queries per KV head,
+# q 2-8), 64-token tiles over 16-token pages, one warp per 16 rows.
 _GFX942_BLOCK_M = 16
+_GFX942_MAX_BLOCK_M = 64
 _GFX942_TILE_SIZE = 64
 _GFX942_MFMA_DIM = 16
+# split-KV grid target, in waves per CU (see _gfx942_split_segments)
+_GFX942_SPLIT_WAVES_PER_CU = 4
 
 
 def _split_launch_config(config):
@@ -677,7 +680,7 @@ def unified_attention(
     if DEVICE_ARCH == "gfx942" and backend == "gluon":
         assert not epilogue and _gfx942_gluon_supported(params), (
             "gfx942 gluon backend runs only head 64, bf16 q/kv/out, 16-token pages, "
-            "8 queries per KV head with max_seqlen_q 2, no window, sinks, softcap, "
+            "8 queries per KV head with max_seqlen_q 2 to 8, no window, sinks, softcap, "
             "alibi, qq_bias, scales, shuffled cache or output epilogue"
         )
         _unified_attention_gfx942(params)
@@ -1832,8 +1835,9 @@ def _unified_attention_3d_gfx950(
 
 
 def _gfx942_gluon_supported(params: _UAParams):
-    """The one shape the gfx942 gluon kernel takes: a single 16-row query block
-    (8 queries per KV head, max_seqlen_q 2), head 64, bf16, 16-token pages."""
+    """The shapes the gfx942 gluon kernel takes: one query block of at most 64
+    rows per sequence (8 queries per KV head, max_seqlen_q 2 to 8), head 64,
+    bf16, 16-token pages."""
     return (
         DEVICE_ARCH == "gfx942"
         and _unified_attention_kernel_gfx942 is not None
@@ -1845,7 +1849,7 @@ def _gfx942_gluon_supported(params: _UAParams):
         and params.out.dtype == torch.bfloat16
         and params.block_size == 16
         and params.num_queries_per_kv == 8
-        and int(params.max_seqlen_q) == 2
+        and 2 <= int(params.max_seqlen_q) <= _GFX942_MAX_BLOCK_M // 8
         and params.causal
         and params.sliding_window == 0
         and params.sinks is None
@@ -1862,12 +1866,51 @@ def _gfx942_gluon_supported(params: _UAParams):
     )
 
 
+def _gfx942_split_segments(params: _UAParams, num_warps: int, tile_size: int) -> int:
+    """KV segments per (kv head, sequence): enough programs for
+    _GFX942_SPLIT_WAVES_PER_CU waves per CU, a power of 2 (the reduce's segment
+    arange), at most one segment per tile of the longest context."""
+    prgms = params.num_seqs * params.num_kv_heads
+    budget = params.num_sms * _GFX942_SPLIT_WAVES_PER_CU // num_warps
+    limit = triton.cdiv(int(params.max_seqlen_k), tile_size)
+    segments = max(1, min(triton.cdiv(budget, prgms), limit))
+    return triton.next_power_of_2(segments)
+
+
 def _unified_attention_gfx942(params: _UAParams):
-    """One program per (kv head, sequence): every sequence fits the one query block."""
-    BLOCK_M = _GFX942_BLOCK_M
+    """One program per (kv head, sequence[, KV segment]): every sequence fits
+    the one query block."""
+    BLOCK_M = max(
+        _GFX942_BLOCK_M,
+        triton.next_power_of_2(int(params.max_seqlen_q) * params.num_queries_per_kv),
+    )
+    num_warps = BLOCK_M // _GFX942_MFMA_DIM
+    NUM_SEGMENTS = _gfx942_split_segments(params, num_warps, _GFX942_TILE_SIZE)
+    _launch_gfx942(params, BLOCK_M, _GFX942_TILE_SIZE, NUM_SEGMENTS, num_warps)
+
+
+def _launch_gfx942(
+    params: _UAParams,
+    BLOCK_M: int,
+    TILE_SIZE: int,
+    NUM_SEGMENTS: int,
+    num_warps: int,
+):
+    """The gfx942 gluon launch, unsplit (NUM_SEGMENTS 1) or split-KV with the
+    Triton reduce_segments merging the fp32 partials into params.out."""
     BLOCK_Q = BLOCK_M // params.num_queries_per_kv
-    assert int(params.max_seqlen_q) <= BLOCK_Q
+    assert BLOCK_M <= _GFX942_MAX_BLOCK_M and int(params.max_seqlen_q) <= BLOCK_Q
     grid = (params.num_kv_heads, params.num_seqs)
+    split = NUM_SEGMENTS > 1
+    if split:
+        grid = grid + (NUM_SEGMENTS,)
+        shape = (params.num_tokens, params.num_query_heads, NUM_SEGMENTS)
+        dev = params.q.device
+        segm_output = torch.empty(
+            shape + (params.head_size_v,), dtype=torch.float32, device=dev
+        )
+        segm_max = torch.empty(shape, dtype=torch.float32, device=dev)
+        segm_expsum = torch.empty(shape, dtype=torch.float32, device=dev)
 
     MAX_INT32 = 2**31 - 1
     USE_LOAD_BUFFER_OP = (
@@ -1912,7 +1955,7 @@ def _unified_attention_gfx942(params: _UAParams):
         NUM_QUERY_HEADS=params.num_query_heads,
         NUM_KV_HEADS=params.num_kv_heads,
         BLOCK_SIZE=params.block_size,
-        TILE_SIZE=_GFX942_TILE_SIZE,
+        TILE_SIZE=TILE_SIZE,
         HEAD_SIZE=params.head_size,
         BLOCK_Q=BLOCK_Q,
         BLOCK_M=BLOCK_M,
@@ -1920,7 +1963,7 @@ def _unified_attention_gfx942(params: _UAParams):
         ARCH_NAME=DEVICE_ARCH,
         USE_LOAD_BUFFER_OP=USE_LOAD_BUFFER_OP,
         USE_STORE_BUFFER_OP=USE_STORE_BUFFER_OP,
-        num_warps=BLOCK_M // _GFX942_MFMA_DIM,
+        num_warps=num_warps,
         ALL_DECODE=False,
         ONE_Q_BLOCK=True,
         CAUSAL=True,
@@ -1928,6 +1971,13 @@ def _unified_attention_gfx942(params: _UAParams):
         NUM_BUFFERS=1,
         SHUFFLED_KV_CACHE=False,
         KV_SHUFFLE_WIDTH=0,
-        NUM_SPLITS=1,
+        NUM_SPLITS=NUM_SEGMENTS,
+        partial_m_ptr=segm_max if split else None,
+        partial_l_ptr=segm_expsum if split else None,
+        partial_acc_ptr=segm_output if split else None,
         enable_fp_fusion=True,
     )
+    if split:
+        _reduce_segments_triton(
+            params, segm_output, segm_max, segm_expsum, NUM_SEGMENTS, TILE_SIZE
+        )
