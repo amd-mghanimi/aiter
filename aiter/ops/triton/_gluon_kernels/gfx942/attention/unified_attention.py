@@ -1071,6 +1071,7 @@ class AttentionProgram:
         output_stride_1,
         split_idx=0,
         NUM_SPLITS: gl.constexpr = 1,
+        SPLIT_TILES: gl.constexpr = 0,
     ):
         num_tiles = (max_seq_prefix_len + cfg.TILE_SIZE - 1) // cfg.TILE_SIZE
         tile_start = 0
@@ -1122,6 +1123,11 @@ class AttentionProgram:
                 seq_tiles = (seq_len + cfg.TILE_SIZE - 1) // cfg.TILE_SIZE
                 tiles_per_split = (seq_tiles - tile_lo + NUM_SPLITS - 1) // NUM_SPLITS
                 split_start = tile_lo + split_idx * tiles_per_split
+            elif SPLIT_TILES > 0:
+                # split rebalance: every segment covers SPLIT_TILES tiles, so a
+                # longer sequence takes more segments instead of longer ones
+                tiles_per_split = SPLIT_TILES
+                split_start = split_idx * tiles_per_split
             else:
                 split_len = NUM_SPLITS * cfg.TILE_SIZE
                 tiles_per_split = (seq_len + split_len - 1) // split_len
@@ -1562,6 +1568,7 @@ def _unified_attention_gluon_kernel(
     partial_m_ptr=None,  # [num_tokens, num_query_heads, NUM_SPLITS]
     partial_l_ptr=None,  # [num_tokens, num_query_heads, NUM_SPLITS]
     partial_acc_ptr=None,  # [num_tokens, num_query_heads, NUM_SPLITS, head_size]
+    SPLIT_TILES: gl.constexpr = 0,  # tiles per segment, 0: cdiv over NUM_SPLITS
 ):
     NUM_WARPS: gl.constexpr = gl.num_warps()
     if ALL_DECODE:
@@ -1727,6 +1734,7 @@ def _unified_attention_gluon_kernel(
         output_stride_1,
         split_idx,
         NUM_SPLITS,
+        SPLIT_TILES,
     )
 
     if NUM_SPLITS > 1 and pgm.tile_start >= pgm.tile_end:

@@ -1895,9 +1895,13 @@ def _launch_gfx942(
     TILE_SIZE: int,
     NUM_SEGMENTS: int,
     num_warps: int,
+    SPLIT_TILES: int = 0,
 ):
     """The gfx942 gluon launch, unsplit (NUM_SEGMENTS 1) or split-KV with the
-    Triton reduce_segments merging the fp32 partials into params.out."""
+    Triton reduce_segments merging the fp32 partials into params.out.
+
+    SPLIT_TILES > 0 fixes the segment length in tiles (split rebalance); the
+    grid's NUM_SEGMENTS must then cover the longest context."""
     BLOCK_Q = BLOCK_M // params.num_queries_per_kv
     assert BLOCK_M <= _GFX942_MAX_BLOCK_M and int(params.max_seqlen_q) <= BLOCK_Q
     grid = (params.num_kv_heads, params.num_seqs)
@@ -1975,9 +1979,34 @@ def _launch_gfx942(
         partial_m_ptr=segm_max if split else None,
         partial_l_ptr=segm_expsum if split else None,
         partial_acc_ptr=segm_output if split else None,
+        SPLIT_TILES=SPLIT_TILES if split else 0,
         enable_fp_fusion=True,
     )
     if split:
+        segm_tiles = None
+        reduce_tile = TILE_SIZE
+        if SPLIT_TILES > 0:
+            # reduce_segments counts cdiv(seq_len, segm_tiles * TILE_SIZE)
+            # segments; one "tile" of SPLIT_TILES * TILE_SIZE keys is a segment
+            segm_tiles = _gfx942_one(params.q.device)
+            reduce_tile = SPLIT_TILES * TILE_SIZE
         _reduce_segments_triton(
-            params, segm_output, segm_max, segm_expsum, NUM_SEGMENTS, TILE_SIZE
+            params,
+            segm_output,
+            segm_max,
+            segm_expsum,
+            NUM_SEGMENTS,
+            reduce_tile,
+            segm_tiles=segm_tiles,
         )
+
+
+_GFX942_ONE = {}
+
+
+def _gfx942_one(device):
+    """A [1] int32 tensor holding 1, made once per device (outside any graph
+    capture after the first call)."""
+    if device not in _GFX942_ONE:
+        _GFX942_ONE[device] = torch.ones(1, dtype=torch.int32, device=device)
+    return _GFX942_ONE[device]
