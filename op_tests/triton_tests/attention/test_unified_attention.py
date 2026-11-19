@@ -2692,7 +2692,8 @@ def test_triton_unified_attn_gfx942_one_q_block(seq_lens, monkeypatch):
 @torch.inference_mode()
 def test_gluon_unified_attn_gfx942_one_q_block(seq_lens, monkeypatch):
     """backend="gluon" on gfx942 sends the one-query-block shape to the gluon kernel:
-    one launch, one program per (kv head, sequence), no Triton kernel."""
+    one launch, one query block per sequence, no Triton kernel. A split adds a
+    power-of-two segment count on the third grid axis."""
     if DEVICE_ARCH != "gfx942":
         pytest.skip("gfx942 gluon one-query-block launch")
     launches = _run_gfx942_one_q_block(
@@ -2701,7 +2702,12 @@ def test_gluon_unified_attn_gfx942_one_q_block(seq_lens, monkeypatch):
     assert len(launches) == 1, f"expected one gluon launch, got {launches}"
     name, grid, one_q_block = launches[0]
     assert name == "gluon" and one_q_block
-    assert grid == (2, len(seq_lens)), f"gluon {grid}: one block per sequence"
+    assert grid[:2] == (2, len(seq_lens)), f"gluon {grid}: one block per sequence"
+    if len(grid) == 3:
+        segments = grid[2]
+        assert segments > 1 and segments & (segments - 1) == 0, grid
+    else:
+        assert len(grid) == 2, grid
 
 
 @pytest.mark.parametrize(
