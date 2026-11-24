@@ -22,7 +22,8 @@ only the axes that matter, joined by '.':
     }
 
 Lookup walks the axes in the order "schema" lists them and takes the first key
-that exists: an exact EQ first, then LEQ bounds ascending, then GEQ
+that exists: an exact EQ first, then inclusive RANGE bounds from narrow to wide,
+then LEQ bounds ascending, then GEQ
 descending, then "any". So the leftmost axis wins: D before Q is what makes
 head_size outrank max_seqlen_q.
 Dtypes fall back too: DT_fp8_fp8, then DT_fp8_any, DT_any_fp8, then "any". The second dtype is the K
@@ -37,6 +38,10 @@ A section with no axes, like reduce above, is just a config.
 Tile size and number of splits (segments) are derived from the following parameters:
 TILE_SIZE_MIN/MAX, and MIN_SEGMENTS/MAX_SEGMENTS/SEGMENTS_PER_CU, plus MFMA_DIM
 and the SPLIT_MIN_* floors; see compute_segment_params.
+SPLIT_PROGRAMS_PER_CU in a kv_split entry splits KV by each sequence's real length
+(bf16 Q, head size 64, up to 4 query heads per KV head). The split also needs
+its other SPLIT_* keys in the kv_split, attn_3d and reduce entries; see
+_length_aware_split.
 """
 
 import copy
@@ -76,6 +81,11 @@ _AXIS_KIND = {
     "DT": "enum",  # (q dtype tag, K cache dtype tag[, V cache dtype tag when it differs])
     # 2d programs per CU, rounded up to a power of 2, so P bounds must be powers of 2
     "P": "num",
+    "C": "num",  # CU count
+    "H": "num",  # query heads
+    "K": "num",  # maximum KV length
+    "SIMPLE": "bool",  # single-sequence, plain causal MHA prefill
+    "EQ": "bool",  # equal query and KV lengths
 }
 
 
@@ -129,6 +139,12 @@ def _bound(component: str) -> int:
     return int(component.rsplit("_", 1)[1])
 
 
+def _range_bounds(component: str) -> tuple[int, int]:
+    lo, hi = (int(v) for v in component.rsplit("_", 2)[1:])
+    assert lo <= hi, f"Invalid config range: {component}"
+    return lo, hi
+
+
 def _candidates(axis: str, value, parts: set) -> list[str]:
     """Components of `axis` matching `value`, most specific first."""
     kind = _AXIS_KIND[axis]
@@ -145,12 +161,17 @@ def _candidates(axis: str, value, parts: set) -> list[str]:
         return ["any"]
 
     eq = sorted(c for c in parts if c.startswith(f"{axis}_EQ_"))
+    ranges = sorted(
+        (c for c in parts if c.startswith(f"{axis}_RANGE_")),
+        key=lambda c: (_range_bounds(c)[1] - _range_bounds(c)[0], _range_bounds(c)),
+    )
     leq = sorted((c for c in parts if c.startswith(f"{axis}_LEQ_")), key=_bound)
     geq = sorted(
         (c for c in parts if c.startswith(f"{axis}_GEQ_")), key=_bound, reverse=True
     )
     return (
         [c for c in eq if value == _bound(c)]
+        + [c for c in ranges if _range_bounds(c)[0] <= value <= _range_bounds(c)[1]]
         + [c for c in leq if value <= _bound(c)]
         + [c for c in geq if value >= _bound(c)]
         + ([axis] if kind == "opt_num" else [])
@@ -197,6 +218,7 @@ def compute_segment_params(config: dict, params) -> dict:
         return config
     small_split_max = config.pop("SMALL_SPLIT_MAX", None)
     per_cu = config.pop("SEGMENTS_PER_CU")
+    split_per_cu = config.pop("SPLIT_SEGMENTS_PER_CU", None)
     lo = config.pop("MIN_SEGMENTS", 1)
     cap = config.pop("MAX_SEGMENTS", None)
     tile_lo = config.pop("SEGMENT_TILE_MIN", 1)
@@ -220,22 +242,27 @@ def compute_segment_params(config: dict, params) -> dict:
     if cap is not None:
         limit = min(cap, limit)
 
-    budget = params.num_sms * per_cu
-    prgms = max(1, params.num_2d_prgms)
-    # this is specific to gfx950 gluon as the num waves depends on mfma dim there
-    if mfma_dim:
-        num_waves = max(
-            1, triton.next_power_of_2(params.num_queries_per_kv) // mfma_dim
-        )
-        budget //= num_waves
-    share = triton.cdiv(budget, prgms)
-    if fit_budget:
-        share = 1 << ((budget // prgms).bit_length() - 1) if budget >= prgms else 0
-    if limit <= min_tiles or share < min_share or too_many_seqs:
-        segments = 1
-    else:
+    def num_segments(per_cu):
+        budget = params.num_sms * per_cu
+        prgms = max(1, params.num_2d_prgms)
+        # this is specific to gfx950 gluon as the num waves depends on mfma dim there
+        if mfma_dim:
+            num_waves = max(
+                1, triton.next_power_of_2(params.num_queries_per_kv) // mfma_dim
+            )
+            budget //= num_waves
+        share = triton.cdiv(budget, prgms)
+        if fit_budget:
+            share = 1 << ((budget // prgms).bit_length() - 1) if budget >= prgms else 0
+        if limit <= min_tiles or share < min_share or too_many_seqs:
+            return 1
         claim = max(min(lo, limit), min(limit, max(1, share)))
-        segments = triton.next_power_of_2(claim)
+        return triton.next_power_of_2(claim)
+
+    segments = num_segments(per_cu)
+    if split_per_cu is not None:
+        # the length-aware split's cap; NUM_SEGMENTS stays the uniform split
+        config["SPLIT_NUM_SEGMENTS"] = num_segments(split_per_cu)
     if small_split_max is None:
         config["NUM_SEGMENTS"] = segments
     elif segments <= min(small_split_max, limit):
@@ -256,6 +283,7 @@ def _axis_values(
     programs_per_cu,
     num_queries_per_kv=1,
     v_dtype=None,
+    extra_axes=(),
 ) -> dict:
     return {
         "D": head_size,
@@ -268,7 +296,53 @@ def _axis_values(
         "DT": (get_dtype_str(q_dtype), get_dtype_str(kv_dtype))
         + ((get_dtype_str(v_dtype),) if v_dtype is not None else ()),
         "P": programs_per_cu,
+        **dict(extra_axes),
     }
+
+
+def _prefill_axes(params) -> tuple:
+    table = getattr(params, "block_table", None)
+    out = getattr(params, "out", None)
+    simple = (
+        getattr(params, "num_seqs", 0) == 1
+        and getattr(params, "num_queries_per_kv", 0) == 1
+        and getattr(params, "num_tokens", 0) == params.max_seqlen_q
+        and params.max_seqlen_k >= params.max_seqlen_q > 1
+        and getattr(params, "causal", False)
+        and not getattr(params, "all_decode", True)
+        and not params.shuffled_kv_cache
+        and params.sliding_window <= 0
+        and getattr(params, "softcap", 0) == 0
+        and not getattr(params, "use_alibi_slopes", False)
+        and not getattr(params, "use_qq_bias", False)
+        and params.head_size == params.head_size_v
+        and params.q_dtype == params.kv_cache_dtype == torch.bfloat16
+        and getattr(params, "v_cache_dtype", params.kv_cache_dtype) == torch.bfloat16
+        and out is not None
+        and out.dtype == params.q_dtype
+        and all(
+            getattr(params, name, None) is None
+            for name in (
+                "sinks",
+                "q_scales",
+                "q_descale",
+                "k_descale",
+                "v_descale",
+                "output_scale",
+            )
+        )
+        and table is not None
+        and table.stride(1) == 1
+        and table.stride(0) == table.shape[1]
+        and table.shape[1] == triton.cdiv(params.max_seqlen_k, params.block_size)
+    )
+    return (
+        ("C", getattr(params, "num_sms", 0)),
+        ("H", getattr(params, "num_query_heads", 0)),
+        ("K", params.max_seqlen_k),
+        ("SIMPLE", simple),
+        ("EQ", params.max_seqlen_q == params.max_seqlen_k),
+    )
 
 
 def _programs_per_cu(params) -> int:
@@ -315,6 +389,7 @@ def _get_unified_attention_config_cached(
     arch: str | None,
     num_queries_per_kv: int = 1,
     v_cache_dtype: torch.dtype | None = None,
+    extra_axes: tuple = (),
 ) -> dict:
     assert op in _OPS, f"Unknown config op {op!r}, expected one of {_OPS}"
     assert head_size > 0, "head_size must be positive"
@@ -333,6 +408,7 @@ def _get_unified_attention_config_cached(
         programs_per_cu,
         num_queries_per_kv,
         v_dtype=v_cache_dtype,
+        extra_axes=extra_axes,
     )
     _, config = _lookup(table, axes, values)
     return compute_tile_params(config, block_size)
@@ -373,6 +449,9 @@ def get_unified_attention_config(
         arch,
         params.num_queries_per_kv,
         v_cache_dtype=getattr(params, "v_cache_dtype", None),
+        extra_axes=(
+            _prefill_axes(params) if op == "attn_2d" and backend == "gluon" else ()
+        ),
     )
     # NUM_SEGMENTS is derived out here rather than in the cached lookup: it
     # reads the launch's program count, which is not part of the cache key.
@@ -394,6 +473,9 @@ def explain(op: str, params, backend: str = "triton", arch: str | None = None) -
         _programs_per_cu(params),
         params.num_queries_per_kv,
         v_dtype=getattr(params, "v_cache_dtype", None),
+        extra_axes=(
+            _prefill_axes(params) if op == "attn_2d" and backend == "gluon" else ()
+        ),
     )
     key, config = _lookup(table, axes, values)
     derived = compute_segment_params(
