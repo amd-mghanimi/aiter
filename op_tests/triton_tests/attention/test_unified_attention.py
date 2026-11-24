@@ -2731,11 +2731,14 @@ def test_unified_attn_split_rebalance_reduce_configs_k4v8(
 
 
 class _LaunchSpy:
-    """Forward each launch to the real kernel and record its grid, ONE_Q_BLOCK and NUM_SPLITS."""
+    """Forward each launch to the real kernel and record its grid, ONE_Q_BLOCK and NUM_SPLITS.
 
-    def __init__(self, kernel, launches):
+    With floors, also record each launch's MIN_SEGMENT_TILES there."""
+
+    def __init__(self, kernel, launches, floors=None):
         self._kernel = kernel
         self._launches = launches
+        self._floors = floors
 
     def __getitem__(self, grid):
         launch = self._kernel[grid]
@@ -2744,17 +2747,29 @@ class _LaunchSpy:
             self._launches.append(
                 (tuple(grid), kwargs["ONE_Q_BLOCK"], kwargs["NUM_SPLITS"])
             )
+            if self._floors is not None:
+                self._floors.append(kwargs["MIN_SEGMENT_TILES"])
             return launch(*args, **kwargs)
 
         return run
 
 
 def _run_one_q_block(
-    seq_lens, num_heads, head_size, block_size, q_dtype, use_descale, monkeypatch
+    seq_lens,
+    num_heads,
+    head_size,
+    block_size,
+    q_dtype,
+    use_descale,
+    monkeypatch,
+    max_seqlen_k=None,
+    floors=None,
 ):
     """Run unified_attention on the gfx950 gluon kernel and check it against the reference.
 
-    Returns the recorded launches as (grid, ONE_Q_BLOCK, NUM_SPLITS).
+    max_seqlen_k, when given, replaces the longest key length as the call's bound
+    (as a CUDA-graph caller passes it). Returns the recorded launches as
+    (grid, ONE_Q_BLOCK, NUM_SPLITS).
     """
     query_lens = [q for q, _ in seq_lens]
     kv_lens_list = [kv for _, kv in seq_lens]
@@ -2796,7 +2811,7 @@ def _run_one_q_block(
     monkeypatch.setattr(
         module,
         "_unified_attention_kernel_gfx950",
-        _LaunchSpy(module._unified_attention_kernel_gfx950, launches),
+        _LaunchSpy(module._unified_attention_kernel_gfx950, launches, floors),
     )
     unified_attention(
         q=query,
@@ -2806,7 +2821,7 @@ def _run_one_q_block(
         cu_seqlens_q=cu_query_lens,
         seqused_k=kv_lens,
         max_seqlen_q=max_query_len,
-        max_seqlen_k=max_kv_len,
+        max_seqlen_k=max_kv_len if max_seqlen_k is None else max_seqlen_k,
         softmax_scale=scale,
         causal=True,
         window_size=window_size,
@@ -2931,6 +2946,56 @@ def test_triton_unified_attn_one_q_block_split_transition(
     assert one_q_block, "short batch did not take the one-query-block launch"
     assert launched_splits == num_splits, f"grid {grid}: want {num_splits} splits"
     assert grid == (2, num_seqs) + ((num_splits,) if num_splits > 1 else ())
+
+
+@pytest.mark.parametrize(
+    "q_dtype, use_descale, query_len, num_seqs, max_seqlen_k, floored",
+    [
+        # the split counts the one-block grid (see the transition test above), so
+        # each sequence fills only the segments its live length sustains
+        (torch.bfloat16, False, 4, 64, None, True),
+        # a CUDA-graph bound: the split sizes off 65536 keys, the floor off the
+        # live lengths
+        (torch.bfloat16, False, 4, 64, 65536, True),
+        # the padded count already splits: that split is kept as is, no floor
+        (torch.bfloat16, False, 4, 8, None, False),
+        # fp8 Q and KV take the transition at 8 queries per sequence
+        (e4m3_dtype, True, 8, 64, None, True),
+        (e4m3_dtype, True, 8, 64, 65536, True),
+        (e4m3_dtype, True, 4, 64, None, False),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_one_q_block_segment_floor(
+    q_dtype, use_descale, query_len, num_seqs, max_seqlen_k, floored, monkeypatch
+):
+    """The one-block split floors each segment at the live length, and the output is
+    correct for sequences that fill one, a few, or all of the segments.
+
+    The live lengths sit on and around the floor's segment boundaries.
+    """
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 gluon one-query-block launch")
+    if torch.cuda.get_device_properties(0).multi_processor_count != 256:
+        pytest.skip("the split counts are for 256 CUs")
+    kv_lens = [17, 1000, 4095, 4096, 4097, 6000, 8191, 8192]
+    floors = []
+    launches = _run_one_q_block(
+        [(query_len, kv_lens[i % len(kv_lens)]) for i in range(num_seqs)],
+        (32, 2),
+        256,
+        16,
+        q_dtype,
+        use_descale,
+        monkeypatch,
+        max_seqlen_k=max_seqlen_k,
+        floors=floors,
+    )
+    assert len(launches) == 1, f"want one launch, got {launches}"
+    grid, one_q_block, num_splits = launches[0]
+    assert one_q_block, "short batch did not take the one-query-block launch"
+    assert num_splits > 1, f"grid {grid}: want a split launch"
+    assert (floors[0] > 0) == floored, f"MIN_SEGMENT_TILES {floors[0]}"
 
 
 class _TritonLaunchSpy:
