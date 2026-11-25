@@ -223,32 +223,49 @@ def compute_segment_params(config: dict, params) -> dict:
     min_share = config.pop("SPLIT_MIN_SHARE", 0)
     fit_budget = config.pop("SPLIT_FIT_BUDGET", False)
     seqs_per_tile = config.pop("SPLIT_SEQS_PER_TILE", 0)
+    seg_min_tiles = config.pop("SPLIT_SEG_MIN_TILES", 0)
+    max_prgms_per_cu = config.pop("SPLIT_MAX_PRGMS_PER_CU", 0)
+
+    # Callers may pass NumPy scalars (e.g. max_seqlen_k from a NumPy array), and
+    # those have no bit_length and can overflow in shifts. Work in Python ints.
+    num_seqs = int(params.num_seqs)
+    num_sms = int(params.num_sms)
+    num_queries_per_kv = int(params.num_queries_per_kv)
+    max_seqlen_q = int(params.max_seqlen_q)
 
     # tokens one segment must cover, so the split never outruns the context
-    tile = triton.next_power_of_2(params.block_size)
+    tile = triton.next_power_of_2(int(params.block_size))
     tile = max(tile_lo, tile if tile_hi is None else min(tile_hi, tile))
-    kv_len = params.max_seqlen_k
+    kv_len = int(params.max_seqlen_k)
     # a sliding-window split carves only the window: rows see at most
     # window + q - 1 keys
     if params.sliding_window > 0:
-        kv_len = min(kv_len, params.sliding_window + params.max_seqlen_q - 1)
+        kv_len = min(kv_len, int(params.sliding_window) + max_seqlen_q - 1)
     limit = triton.cdiv(kv_len, tile)
-    too_many_seqs = seqs_per_tile and params.num_seqs > seqs_per_tile * limit
+    too_many_seqs = seqs_per_tile and num_seqs > seqs_per_tile * limit
     if cap is not None:
         limit = min(cap, limit)
 
-    budget = params.num_sms * per_cu
-    prgms = max(1, params.num_2d_prgms)
+    budget = num_sms * per_cu
+    prgms = max(1, int(params.num_2d_prgms))
     # this is specific to gfx950 gluon as the num waves depends on mfma dim there
     if mfma_dim:
-        num_waves = max(
-            1, triton.next_power_of_2(params.num_queries_per_kv) // mfma_dim
-        )
+        num_waves = max(1, triton.next_power_of_2(num_queries_per_kv) // mfma_dim)
         budget //= num_waves
     share = triton.cdiv(budget, prgms)
     if fit_budget:
         share = 1 << ((budget // prgms).bit_length() - 1) if budget >= prgms else 0
-    if limit <= min_tiles or share < min_share or too_many_seqs:
+        if seg_min_tiles and share * seg_min_tiles > limit:
+            # Segments shorter than seg_min_tiles only pay while the batch
+            # leaves at least half of the GPU idle.
+            half = budget // 2 // prgms
+            half = 1 << (half.bit_length() - 1) if half else 0
+            longest = 1 << (max(1, limit // seg_min_tiles).bit_length() - 1)
+            share = max(longest, half)
+    # past this many programs per CU the unsplit grid already streams KV at
+    # full bandwidth, and splitting only adds partials
+    too_busy = max_prgms_per_cu and prgms > max_prgms_per_cu * num_sms
+    if limit <= min_tiles or share < min_share or too_many_seqs or too_busy:
         segments = 1
     else:
         claim = max(min(lo, limit), min(limit, max(1, share)))
