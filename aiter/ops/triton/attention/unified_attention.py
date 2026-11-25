@@ -324,17 +324,22 @@ def _gfx950_split_params(params: _UAParams):
         return params
     if q_rows <= 128 and params.sliding_window <= 0:
         # one query block per sequence; count that grid only while the
-        # padded count leaves the launch unsplit. That split sizes off
-        # max_seqlen_k, a bound under CUDA graphs, so each sequence fills only
-        # the segments its live length sustains.
+        # padded count leaves the launch unsplit and the grid does not fill the CUs.
+        # That split sizes off max_seqlen_k, a bound under CUDA graphs, so each
+        # sequence fills only the segments its live length sustains.
         config = get_unified_attention_config("kv_split", params, backend="gluon")
         if _split_launch_config(config)[0] > 1:
             return params
-        prgms = params.num_seqs * params.num_kv_heads
+        # ONE_BLOCK_SPLIT_MAX_FILL: programs per CU from which the one-block grid
+        # fills the GPU, so a split only adds partials and a reduce
+        one_block_prgms = params.num_seqs * params.num_kv_heads
+        max_fill = config.get("ONE_BLOCK_SPLIT_MAX_FILL")
+        if max_fill is not None and one_block_prgms >= max_fill * params.num_sms:
+            return params
         return params._replace(
-            num_2d_prgms=prgms,
+            num_2d_prgms=one_block_prgms,
             min_segment_keys=_gfx950_one_block_segment_keys(
-                config, prgms, params.num_sms
+                config, one_block_prgms, params.num_sms
             ),
         )
     config = get_unified_attention_config("attn_3d", params, backend="gluon")

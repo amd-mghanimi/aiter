@@ -2982,6 +2982,36 @@ def test_triton_unified_attn_one_q_block_split_transition(
 
 
 @pytest.mark.parametrize(
+    "num_seqs, num_splits",
+    [
+        # one-block grid 256 * 2 = 512 programs, two CU waves: still split, in the
+        # 2 segments 8192 keys fill at the segment floor (4096 keys)
+        (256, 2),
+        # 320 * 2 = 640 programs, 2.5 CU waves: the grid fills the CUs, kept unsplit
+        (320, 1),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_one_q_block_split_grid_gate(
+    num_seqs, num_splits, monkeypatch
+):
+    """The transition split stays off once the one-block grid fills the CUs
+    (fp8 -hq 16 -hk 2 -d 64 -sq 8 -sk 8192).
+    """
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 gluon one-query-block launch")
+    if torch.cuda.get_device_properties(0).multi_processor_count != 256:
+        pytest.skip("the split counts are for 256 CUs")
+    launches = _run_one_q_block(
+        [(8, 8192)] * num_seqs, (16, 2), 64, 16, e4m3_dtype, True, monkeypatch
+    )
+    assert len(launches) == 1, f"want one launch, got {launches}"
+    grid, one_q_block, launched_splits = launches[0]
+    assert one_q_block, "short batch did not take the one-query-block launch"
+    assert launched_splits == num_splits, f"grid {grid}: want {num_splits} splits"
+
+
+@pytest.mark.parametrize(
     "q_dtype, use_descale, query_len, num_seqs, max_seqlen_k, floored",
     [
         # the split counts the one-block grid (see the transition test above), so
