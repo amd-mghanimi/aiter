@@ -141,23 +141,6 @@ _GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx1250-strict", "gfx950")
 
 # LDS the gfx950 KV double buffer may occupy; a wider tile falls back to one buffer.
 _GFX950_LDS_BUDGET = 160 * 1024
-# The one-block split's floor on keys per segment: a shorter segment costs more
-# in its query block and partials than its keys save. The full floor holds from
-# FULL_FLOOR_FILL / 4 programs (num_seqs * num_kv_heads) per CU; a smaller grid
-# needs its segments for occupancy, so its floor drops in proportion, by powers
-# of two (a constexpr of the kernel) down to LO_KEYS.
-_GFX950_ONE_BLOCK_SEGMENT_MIN_KEYS = 4096
-_GFX950_ONE_BLOCK_SEGMENT_LO_KEYS = 512
-_GFX950_ONE_BLOCK_FULL_FLOOR_FILL = 4
-# reduce_segments_one_block: ROWS query rows and WARPS warps per program, one
-# segment per step. A grid under MIN_PROGRAMS is latency-bound: it halves the
-# rows until it reaches MIN_PROGRAMS (or one row), takes SMALL_WARPS, and
-# merges up to ELEMS partial values per step.
-_GFX950_ONE_BLOCK_REDUCE_ROWS = 16
-_GFX950_ONE_BLOCK_REDUCE_WARPS = 4
-_GFX950_ONE_BLOCK_REDUCE_MIN_PROGRAMS = 256
-_GFX950_ONE_BLOCK_REDUCE_SMALL_WARPS = 1
-_GFX950_ONE_BLOCK_REDUCE_ELEMS = 1024
 
 
 def _is_gluon_available():
@@ -314,15 +297,24 @@ def _gfx950_gluon_supported(params: _UAParams):
     )
 
 
-def _gfx950_one_block_segment_keys(prgms: int) -> int:
-    """The one-block split's segment floor in keys, for a grid of prgms programs."""
-    full = max(1, get_num_sms() * _GFX950_ONE_BLOCK_FULL_FLOOR_FILL // 4)
-    keys = _GFX950_ONE_BLOCK_SEGMENT_MIN_KEYS * min(prgms, full) // full
+def _gfx950_one_block_segment_keys(config: dict, prgms: int, num_sms: int) -> int:
+    """The one-block split's segment floor in keys, for a grid of prgms programs.
+
+    From the kv_split leaf: a segment shorter than ONE_BLOCK_SEGMENT_MIN_KEYS costs
+    more in its query block and partials than its keys save. That full floor holds
+    from ONE_BLOCK_FLOOR_FULL_FILL programs (num_seqs * num_kv_heads) per CU; a
+    smaller grid needs its segments for occupancy, so its floor drops in proportion,
+    by powers of two (a constexpr of the kernel) down to ONE_BLOCK_SEGMENT_LO_KEYS.
+    A leaf without ONE_BLOCK_SEGMENT_MIN_KEYS sets no floor (0).
+    """
+    min_keys = config.get("ONE_BLOCK_SEGMENT_MIN_KEYS")
+    if min_keys is None:
+        return 0
+    lo_keys = config["ONE_BLOCK_SEGMENT_LO_KEYS"]
+    full = max(1, int(num_sms * config["ONE_BLOCK_FLOOR_FULL_FILL"]))
+    keys = min_keys * min(prgms, full) // full
     keys = 1 << max(keys, 1).bit_length() - 1
-    return max(
-        min(_GFX950_ONE_BLOCK_SEGMENT_LO_KEYS, _GFX950_ONE_BLOCK_SEGMENT_MIN_KEYS),
-        keys,
-    )
+    return max(min(lo_keys, min_keys), keys)
 
 
 def _gfx950_split_params(params: _UAParams):
@@ -341,7 +333,9 @@ def _gfx950_split_params(params: _UAParams):
         prgms = params.num_seqs * params.num_kv_heads
         return params._replace(
             num_2d_prgms=prgms,
-            min_segment_keys=_gfx950_one_block_segment_keys(prgms),
+            min_segment_keys=_gfx950_one_block_segment_keys(
+                config, prgms, params.num_sms
+            ),
         )
     config = get_unified_attention_config("attn_3d", params, backend="gluon")
     block_m = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
@@ -1350,20 +1344,28 @@ def _reduce_segments_one_block_gfx950(
 ):
     """Merge the gfx950 one-block split on its producer's grid (see
     reduce_segments_one_block)."""
+    # the reduce section: ROWS query rows and num_warps warps per program, one
+    # segment per step. A grid under MIN_FILL programs per CU is latency-bound: it
+    # halves the rows until it reaches that (or one row), takes SMALL_WARPS, and
+    # merges up to SMALL_ELEMS partial values per step.
+    config = get_unified_attention_config("reduce", params, backend="gluon")
+    full_rows = config["ROWS"]
+    assert full_rows > 0 and full_rows & (full_rows - 1) == 0, "ROWS: a power of 2"
+    min_prgms = config["MIN_FILL"] * params.num_sms
     q_rows = int(params.max_seqlen_q) * params.num_queries_per_kv
-    rows = _GFX950_ONE_BLOCK_REDUCE_ROWS
+    rows = full_rows
     while (
         rows > 1
         and params.num_seqs * params.num_kv_heads * triton.cdiv(q_rows, rows)
-        < _GFX950_ONE_BLOCK_REDUCE_MIN_PROGRAMS
+        < min_prgms
     ):
         rows //= 2
-    segment_block, num_warps = 1, _GFX950_ONE_BLOCK_REDUCE_WARPS
-    if rows < _GFX950_ONE_BLOCK_REDUCE_ROWS:
+    segment_block, num_warps = 1, config["num_warps"]
+    if rows < full_rows:
         vdp = triton.next_power_of_2(params.head_size_v)
-        segment_block = max(1, _GFX950_ONE_BLOCK_REDUCE_ELEMS // (rows * vdp))
+        segment_block = max(1, config["SMALL_ELEMS"] // (rows * vdp))
         segment_block = min(NUM_SEGMENTS, 1 << segment_block.bit_length() - 1)
-        num_warps = _GFX950_ONE_BLOCK_REDUCE_SMALL_WARPS
+        num_warps = config["SMALL_WARPS"]
     row_blocks = triton.cdiv(q_rows, rows)
     reduce_segments_one_block[(params.num_seqs, params.num_kv_heads, row_blocks)](
         output_ptr=params.out,
