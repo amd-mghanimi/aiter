@@ -3065,6 +3065,47 @@ def test_triton_unified_attn_one_q_block_segment_floor_epilogue(
     assert (floors[0] > 0) == floored, f"MIN_SEGMENT_TILES {floors[0]}"
 
 
+@pytest.mark.parametrize(
+    "num_seqs, max_seqlen_k",
+    [
+        # few sequences: the cost model splits finely, the floor is its minimum
+        (16, None),
+        (16, 65536),
+        # a graph bound sizes the cost model's split off 65536 keys
+        (192, 65536),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_one_q_block_cost_split_floor(
+    num_seqs, max_seqlen_k, monkeypatch
+):
+    """bf16 head 64 short queries take the kv_split cost model's split; that split
+    is floored at the live length too, and the output is correct.
+    """
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 gluon one-query-block launch")
+    if torch.cuda.get_device_properties(0).multi_processor_count != 256:
+        pytest.skip("the split counts are for 256 CUs")
+    kv_lens = [17, 1000, 4095, 4096, 4097, 6000, 8191, 8192]
+    floors = []
+    launches = _run_one_q_block(
+        [(8, kv_lens[i % len(kv_lens)]) for i in range(num_seqs)],
+        (16, 2),
+        64,
+        16,
+        torch.bfloat16,
+        False,
+        monkeypatch,
+        max_seqlen_k=max_seqlen_k,
+        floors=floors,
+    )
+    assert len(launches) == 1, f"want one launch, got {launches}"
+    grid, one_q_block, num_splits = launches[0]
+    assert one_q_block, "short batch did not take the one-query-block launch"
+    assert num_splits > 1, f"grid {grid}: want a split launch"
+    assert floors[0] > 0, f"MIN_SEGMENT_TILES {floors[0]}"
+
+
 class _TritonLaunchSpy:
     """Forward each launch and record the kernel, grid, and ONE_Q_BLOCK."""
 
