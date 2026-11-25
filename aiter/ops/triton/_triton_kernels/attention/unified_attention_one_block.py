@@ -29,6 +29,7 @@ def reduce_segments_one_block(
     V_HEAD_SIZE: tl.constexpr,
     V_HEAD_SIZE_PADDED: tl.constexpr,
     ROWS: tl.constexpr,  # (query token, query head) rows per program
+    SEGMENT_BLOCK: tl.constexpr,  # segments merged per step, as one [ROWS, block, D] load
     # the producer stored the output of a sequence that fits one segment
     SKIP_SINGLE_SEGMENT: tl.constexpr,
     FP8_MIN: tl.constexpr = float8_info.min,
@@ -91,21 +92,54 @@ def reduce_segments_one_block(
     acc_base = token_idx * (
         NUM_QUERY_HEADS * NUM_SEGMENTS * V_HEAD_SIZE_PADDED
     ) + head_idx * (NUM_SEGMENTS * V_HEAD_SIZE_PADDED)
-    acc_sum = tl.zeros([ROWS, V_HEAD_SIZE_PADDED], dtype=tl.float32)
-    for s in range(act_num_segments):
-        w = tl.math.exp2(
-            tl.load(segm_max_ptr + ml_base + s, mask=row_mask, other=float("-inf"))
-            - overall_max
-        )
+    if SEGMENT_BLOCK >= NUM_SEGMENTS:
         segm_output = tl.load(
             segm_output_ptr
-            + acc_base[:, None]
-            + s * V_HEAD_SIZE_PADDED
-            + offs_d[None, :],
-            mask=row_mask[:, None] & d_mask[None, :],
+            + acc_base[:, None, None]
+            + offs_s[None, :, None] * V_HEAD_SIZE_PADDED
+            + offs_d[None, None, :],
+            mask=ml_mask[:, :, None] & d_mask[None, None, :],
             other=0.0,
         )
-        acc_sum += segm_output * w[:, None]
+        acc_sum = tl.sum(segm_output * weight[:, :, None], axis=1)
+    elif SEGMENT_BLOCK == 1:
+        acc_sum = tl.zeros([ROWS, V_HEAD_SIZE_PADDED], dtype=tl.float32)
+        for s in range(act_num_segments):
+            w = tl.math.exp2(
+                tl.load(segm_max_ptr + ml_base + s, mask=row_mask, other=float("-inf"))
+                - overall_max
+            )
+            segm_output = tl.load(
+                segm_output_ptr
+                + acc_base[:, None]
+                + s * V_HEAD_SIZE_PADDED
+                + offs_d[None, :],
+                mask=row_mask[:, None] & d_mask[None, :],
+                other=0.0,
+            )
+            acc_sum += segm_output * w[:, None]
+    else:
+        acc_sum = tl.zeros([ROWS, V_HEAD_SIZE_PADDED], dtype=tl.float32)
+        offs_b = tl.arange(0, SEGMENT_BLOCK)
+        for s0 in range(0, act_num_segments, SEGMENT_BLOCK):
+            b_mask = row_mask[:, None] & ((s0 + offs_b) < act_num_segments)[None, :]
+            w = tl.math.exp2(
+                tl.load(
+                    segm_max_ptr + ml_base[:, None] + s0 + offs_b[None, :],
+                    mask=b_mask,
+                    other=float("-inf"),
+                )
+                - overall_max[:, None]
+            )
+            segm_output = tl.load(
+                segm_output_ptr
+                + acc_base[:, None, None]
+                + (s0 + offs_b)[None, :, None] * V_HEAD_SIZE_PADDED
+                + offs_d[None, None, :],
+                mask=b_mask[:, :, None] & d_mask[None, None, :],
+                other=0.0,
+            )
+            acc_sum += tl.sum(segm_output * w[:, :, None], axis=1)
     acc = tl.where(
         overall_expsum[:, None] == 0.0, 0.0, acc_sum / overall_expsum[:, None]
     )
