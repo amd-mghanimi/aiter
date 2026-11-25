@@ -500,5 +500,12 @@
       "ONE_BLOCK_SEGMENT_LO_KEYS": 512,
       "ONE_BLOCK_FLOOR_FULL_FILL": 1.0
     }
+  },
+  "reduce": {
+    "ROWS": 16,
+    "num_warps": 4,
+    "MIN_FILL": 1.0,
+    "SMALL_WARPS": 1,
+    "SMALL_ELEMS": 1024
   }
 }
