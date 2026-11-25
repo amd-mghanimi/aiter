@@ -371,7 +371,7 @@ def _gfx950_split_params(params: _UAParams):
 
 
 def _gfx950_short_query(params: _UAParams):
-    """Short bf16 queries that the split grid launches as one block per sequence.
+    """Short bf16 or fp8 queries that the split grid launches as one block per sequence.
 
     The split grid sizes BLOCK_M to the query group, so each sequence is one
     query block with no masked rows, where the 2d grid's BLOCK_M 128 leaves
@@ -383,7 +383,7 @@ def _gfx950_short_query(params: _UAParams):
     """
     if not (
         not params.all_decode
-        and params.q_dtype == torch.bfloat16
+        and params.q_dtype in (torch.bfloat16, e4m3_dtype)
         and params.head_size <= 64
         and params.max_seqlen_q * params.num_queries_per_kv <= 128
     ):
@@ -405,18 +405,27 @@ def _gfx950_tile_size(params: _UAParams, tile: int):
     one program per CU for decode, and on the 2d grid past one program per CU
     dense or two shuffled. Short queries on the split grid (see
     _gfx950_short_query) widen at any program count they are used at. Sliding
-    windows keep the 64-key tile. Measured for bf16 and head size 64 only; at
-    head 256 the wider tile is slower.
+    windows keep the 64-key tile. Measured for head size 64 only; at head 256
+    the wider tile is slower. For fp8 the wide tile pays only with at least
+    TILE_WIDE_MIN_Q_ROWS_FP8 query rows (32 rows lost 3-4 % at q=4, batch 64
+    and 128) and never for decode (+7 % to +15 %).
     """
     if (
         params.sliding_window > 0
-        or params.q_dtype != torch.bfloat16
+        or params.q_dtype not in (torch.bfloat16, e4m3_dtype)
         or params.head_size > 64
         or params.max_seqlen_q * params.num_queries_per_kv > 128
     ):
         return tile
     # the thresholds and the wide tile size are tuned in configs/ (kv_tile)
     policy = get_unified_attention_config("kv_tile", params, backend="gluon")
+    if params.q_dtype == e4m3_dtype and (
+        params.all_decode
+        or params.max_seqlen_q * params.num_queries_per_kv
+        < policy["TILE_WIDE_MIN_Q_ROWS_FP8"]
+    ):
+        # fp8 keeps the 64-key tile for decode and for fewer query rows
+        return tile
     num_segments = get_unified_attention_config(
         "kv_split", _gfx950_split_params(params), backend="gluon"
     )["NUM_SEGMENTS"]
