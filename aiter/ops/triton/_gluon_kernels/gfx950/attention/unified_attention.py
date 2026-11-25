@@ -1641,35 +1641,6 @@ class AttentionProgram:
         gl.store(partial_m_ptr + ml_offs, M, mask=row_mask)
         gl.store(partial_l_ptr + ml_offs, L, mask=row_mask)
 
-    @gluon.jit
-    def mark_single_segment(
-        self,
-        partial_m_ptr,
-        q_block_local_idx,
-        cur_batch_in_all_start_index,
-        kv_head_idx,
-        cur_batch_query_len,
-        NUM_SPLITS: gl.constexpr,
-    ):
-        """Set segment 0's partial max to +inf, a value no split stores (an empty
-        one stores -inf), so reduce_segments skips the row from that one load.
-        Split 0 of a sequence that spans several segments always overwrites it."""
-        cfg: gl.constexpr = self.cfg
-        layout: gl.constexpr = gl.SliceLayout(1, cfg.pv_layout)
-        offs_m = gl.arange(0, cfg.BLOCK_M, layout=layout)
-        query_pos = q_block_local_idx * cfg.BLOCK_Q + offs_m // cfg.NUM_QUERIES_PER_KV
-        query_offset_0 = cur_batch_in_all_start_index + query_pos
-        query_offset_1 = (
-            kv_head_idx * cfg.NUM_QUERIES_PER_KV + offs_m % cfg.NUM_QUERIES_PER_KV
-        )
-        row_mask = (query_pos < cur_batch_query_len) & (
-            query_offset_1 < cfg.NUM_QUERY_HEADS
-        )
-        ml_stride_0: gl.constexpr = cfg.NUM_QUERY_HEADS * NUM_SPLITS
-        ml_offs = query_offset_0 * ml_stride_0 + query_offset_1 * NUM_SPLITS
-        mark = gl.full([cfg.BLOCK_M], float("inf"), dtype=gl.float32, layout=layout)
-        gl.store(partial_m_ptr + ml_offs, mark, mask=row_mask)
-
 
 @gluon.jit
 def attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc):
@@ -1969,10 +1940,10 @@ def _unified_attention_gluon_kernel(
     PRELOAD_TABLE_STRIDE: gl.constexpr = 0,
     USE_EXPLICIT_FMA: gl.constexpr = False,
     # Split-KV floor on tiles per segment: a short sequence fills fewer of the
-    # NUM_SPLITS segments; reduce_segments must carve with the same floor
+    # NUM_SPLITS segments; reduce_segments_one_block carves with the same floor
     MIN_SEGMENT_TILES: gl.constexpr = 0,
     # with MIN_SEGMENT_TILES: a sequence that fits one segment stores its output
-    # directly, and reduce_segments skips its rows (SKIP_SINGLE_SEGMENT)
+    # directly, and reduce_segments_one_block skips it
     SINGLE_SEGMENT_STORE: gl.constexpr = False,
 ):
     NUM_WARPS: gl.constexpr = gl.num_warps()
@@ -2052,7 +2023,7 @@ def _unified_attention_gluon_kernel(
         if q_block_local_idx * cfg.BLOCK_Q >= cur_batch_query_len:
             return
         if NUM_SPLITS > 1 and MIN_SEGMENT_TILES > 0:
-            # a segment past the sequence end: reduce_segments masks it out
+            # a segment past the sequence end: reduce_segments_one_block masks it out
             seq_len_early = gl.load(seq_lens_ptr + seq_idx).to(gl.int32)
             seg_tiles = gl.maximum(
                 (seq_len_early + NUM_SPLITS * TILE_SIZE - 1)
@@ -2254,22 +2225,13 @@ def _unified_attention_gluon_kernel(
         single_segment = False
         if SINGLE_SEGMENT_STORE:
             # the whole sequence fits segment 0: store the output, which
-            # reduce_segments then leaves alone
+            # reduce_segments_one_block then leaves alone
             seg_tiles = gl.maximum(
                 (seq_len + NUM_SPLITS * TILE_SIZE - 1) // (NUM_SPLITS * TILE_SIZE),
                 MIN_SEGMENT_TILES,
             )
             single_segment = seq_len <= seg_tiles * TILE_SIZE
-        if single_segment:
-            pgm.mark_single_segment(
-                partial_m_ptr,
-                q_block_local_idx,
-                cur_batch_in_all_start_index,
-                kv_head_idx,
-                cur_batch_query_len,
-                NUM_SPLITS,
-            )
-        else:
+        if not single_segment:
             pgm.store_partial(
                 M,
                 L,

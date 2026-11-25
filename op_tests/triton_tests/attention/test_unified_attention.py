@@ -2764,11 +2764,13 @@ def _run_one_q_block(
     monkeypatch,
     max_seqlen_k=None,
     floors=None,
+    epilogue=None,
 ):
     """Run unified_attention on the gfx950 gluon kernel and check it against the reference.
 
     max_seqlen_k, when given, replaces the longest key length as the call's bound
-    (as a CUDA-graph caller passes it). Returns the recorded launches as
+    (as a CUDA-graph caller passes it). epilogue "gate" passes an output gate,
+    "rows" an output_rows selection. Returns the recorded launches as
     (grid, ONE_Q_BLOCK, NUM_SPLITS).
     """
     query_lens = [q for q, _ in seq_lens]
@@ -2813,6 +2815,28 @@ def _run_one_q_block(
         "_unified_attention_kernel_gfx950",
         _LaunchSpy(module._unified_attention_kernel_gfx950, launches, floors),
     )
+    num_tokens, num_query_heads = query.shape[0], query.shape[1]
+    epilogue_kwargs = {}
+    if epilogue == "gate":
+        gen = torch.Generator(device="cuda").manual_seed(0)
+        epilogue_kwargs["output_gate"] = (
+            3
+            * torch.randn(
+                num_tokens, num_query_heads * head_size, generator=gen, device="cuda"
+            )
+        ).to(torch.bfloat16)
+    elif epilogue == "rows":
+        gen = torch.Generator(device="cuda").manual_seed(0)
+        epilogue_kwargs["output_rows"] = torch.randperm(
+            num_tokens, generator=gen, device="cuda"
+        )[: max(1, num_tokens // 3)]
+        output = torch.empty(
+            epilogue_kwargs["output_rows"].numel(),
+            num_query_heads,
+            head_size,
+            dtype=output.dtype,
+            device="cuda",
+        )
     unified_attention(
         q=query,
         k=key_cache,
@@ -2830,6 +2854,7 @@ def _run_one_q_block(
         q_descale=q_descale,
         k_descale=k_descale,
         v_descale=v_descale,
+        **epilogue_kwargs,
     )
 
     assert launches, "the gfx950 gluon kernel did not launch"
@@ -2847,6 +2872,11 @@ def _run_one_q_block(
         k_descale=k_descale,
         v_descale=v_descale,
     ).float()
+    if epilogue == "gate":
+        gate = epilogue_kwargs["output_gate"].float().sigmoid().to(torch.bfloat16)
+        ref = (ref.to(torch.bfloat16) * gate.view_as(ref)).float()
+    elif epilogue == "rows":
+        ref = ref[epilogue_kwargs["output_rows"]]
     out = output.float()
     if use_descale:
         # NaN > x is false, so an all-NaN fp8 output would pass the budget below
@@ -2907,8 +2937,11 @@ def test_triton_unified_attn_one_q_block(
         # so the padded count is 256 tokens // 1 + 64 seqs = 320 per KV head, 640
         # programs for 2 KV heads: more than the 256 CUs, so the launch stays unsplit.
         # The one-block grid is 64 * 2 = 128 programs, half the CUs. Counting it is
-        # what makes this launch split.
+        # what makes this launch split: 4 segments, the 4 that 8192 keys fill at
+        # the segment floor (2048 keys for 128 programs on 256 CUs).
         (64, 8192, 4),
+        # at 2048 keys one segment holds the whole sequence: no split
+        (64, 2048, 1),
         # padded: 32 // 1 + 8 = 40 per KV head, 80 programs. That already splits (8),
         # so it is kept. Counting the one-block grid (16 programs) as well would give
         # 32 segments instead of 8.
@@ -2990,6 +3023,40 @@ def test_triton_unified_attn_one_q_block_segment_floor(
         monkeypatch,
         max_seqlen_k=max_seqlen_k,
         floors=floors,
+    )
+    assert len(launches) == 1, f"want one launch, got {launches}"
+    grid, one_q_block, num_splits = launches[0]
+    assert one_q_block, "short batch did not take the one-query-block launch"
+    assert num_splits > 1, f"grid {grid}: want a split launch"
+    assert (floors[0] > 0) == floored, f"MIN_SEGMENT_TILES {floors[0]}"
+
+
+@pytest.mark.parametrize("max_seqlen_k", [None, 65536])
+@pytest.mark.parametrize("epilogue, floored", [("gate", True), ("rows", False)])
+@torch.inference_mode()
+def test_triton_unified_attn_one_q_block_segment_floor_epilogue(
+    epilogue, floored, max_seqlen_k, monkeypatch
+):
+    """The output gate keeps the floor (reduce_segments_one_block applies it).
+    output_rows is reduce_segments' epilogue, so that launch keeps the split as is.
+    """
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 gluon one-query-block launch")
+    if torch.cuda.get_device_properties(0).multi_processor_count != 256:
+        pytest.skip("the split counts are for 256 CUs")
+    kv_lens = [17, 1000, 4095, 4096, 4097, 6000, 8191, 8192]
+    floors = []
+    launches = _run_one_q_block(
+        [(4, kv_lens[i % len(kv_lens)]) for i in range(64)],
+        (32, 2),
+        256,
+        16,
+        torch.bfloat16,
+        False,
+        monkeypatch,
+        max_seqlen_k=max_seqlen_k,
+        floors=floors,
+        epilogue=epilogue,
     )
     assert len(launches) == 1, f"want one launch, got {launches}"
     grid, one_q_block, num_splits = launches[0]

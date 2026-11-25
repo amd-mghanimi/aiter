@@ -16,6 +16,9 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     reduce_segments,
     unified_attention_3d_split_rebalance_kernel,
 )
+from aiter.ops.triton._triton_kernels.attention.unified_attention_one_block import (
+    reduce_segments_one_block,
+)
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
 from aiter.ops.triton.utils.device_info import get_num_sms
@@ -139,8 +142,16 @@ _GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx1250-strict", "gfx950")
 # LDS the gfx950 KV double buffer may occupy; a wider tile falls back to one buffer.
 _GFX950_LDS_BUDGET = 160 * 1024
 # The one-block split's floor on keys per segment: a shorter segment costs more
-# in its query block and partials than its keys save
+# in its query block and partials than its keys save. The full floor holds from
+# FULL_FLOOR_FILL / 4 programs (num_seqs * num_kv_heads) per CU; a smaller grid
+# needs its segments for occupancy, so its floor drops in proportion, by powers
+# of two (a constexpr of the kernel) down to LO_KEYS.
 _GFX950_ONE_BLOCK_SEGMENT_MIN_KEYS = 4096
+_GFX950_ONE_BLOCK_SEGMENT_LO_KEYS = 512
+_GFX950_ONE_BLOCK_FULL_FLOOR_FILL = 4
+# reduce_segments_one_block: query rows and warps per program
+_GFX950_ONE_BLOCK_REDUCE_ROWS = 16
+_GFX950_ONE_BLOCK_REDUCE_WARPS = 4
 
 
 def _is_gluon_available():
@@ -297,6 +308,17 @@ def _gfx950_gluon_supported(params: _UAParams):
     )
 
 
+def _gfx950_one_block_segment_keys(prgms: int) -> int:
+    """The one-block split's segment floor in keys, for a grid of prgms programs."""
+    full = max(1, get_num_sms() * _GFX950_ONE_BLOCK_FULL_FLOOR_FILL // 4)
+    keys = _GFX950_ONE_BLOCK_SEGMENT_MIN_KEYS * min(prgms, full) // full
+    keys = 1 << max(keys, 1).bit_length() - 1
+    return max(
+        min(_GFX950_ONE_BLOCK_SEGMENT_LO_KEYS, _GFX950_ONE_BLOCK_SEGMENT_MIN_KEYS),
+        keys,
+    )
+
+
 def _gfx950_split_params(params: _UAParams):
     """Size the split by the gluon grid when a sequence spans several query blocks."""
     q_rows = params.max_seqlen_q * params.num_queries_per_kv
@@ -310,9 +332,10 @@ def _gfx950_split_params(params: _UAParams):
         config = get_unified_attention_config("kv_split", params, backend="gluon")
         if _split_launch_config(config)[0] > 1:
             return params
+        prgms = params.num_seqs * params.num_kv_heads
         return params._replace(
-            num_2d_prgms=params.num_seqs * params.num_kv_heads,
-            min_segment_keys=_GFX950_ONE_BLOCK_SEGMENT_MIN_KEYS,
+            num_2d_prgms=prgms,
+            min_segment_keys=_gfx950_one_block_segment_keys(prgms),
         )
     config = get_unified_attention_config("attn_3d", params, backend="gluon")
     block_m = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
@@ -778,13 +801,24 @@ def unified_attention(
             TILE_SIZE = block_size
         else:
             TILE_SIZE = CONFIG_TILE_SIZE
-        # skip_reduce hands the caller partials it carves without the floor
+        # skip_reduce hands the caller partials it carves without the floor, and
+        # output_rows is reduce_segments' epilogue: both keep the split as is
         min_segment_tiles = 0
-        if NUM_SEGMENTS > 1 and split_params.min_segment_keys and not skip_reduce:
-            min_segment_tiles = triton.cdiv(split_params.min_segment_keys, TILE_SIZE)
+        if split_params.min_segment_keys and not skip_reduce and output_rows is None:
+            # no more segments than the longest sequence fills at the floor
+            NUM_SEGMENTS = min(
+                NUM_SEGMENTS,
+                triton.next_power_of_2(
+                    triton.cdiv(int(params.max_seqlen_k), split_params.min_segment_keys)
+                ),
+            )
+            if NUM_SEGMENTS > 1:
+                min_segment_tiles = triton.cdiv(
+                    split_params.min_segment_keys, TILE_SIZE
+                )
         # a sequence that fits one segment goes straight to out, unless the
-        # epilogue's reduce has to write it
-        single_segment_store = min_segment_tiles > 0 and not epilogue
+        # gate has to be applied to it
+        single_segment_store = min_segment_tiles > 0 and output_gate is None
 
         if NUM_SEGMENTS > 1:
             segm_output = torch.empty(
@@ -880,6 +914,18 @@ def unified_attention(
                 output_gate=output_gate,
                 output_rows=output_rows,
             )
+        elif min_segment_tiles:
+            _reduce_segments_one_block_gfx950(
+                params._replace(out=final_out),
+                segm_output,
+                segm_max,
+                segm_expsum,
+                NUM_SEGMENTS,
+                TILE_SIZE,
+                min_segment_tiles,
+                single_segment_store,
+                output_gate=output_gate,
+            )
         elif use_gluon_reduce:
             if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
                 _reduce_segments_gfx1250(
@@ -904,8 +950,6 @@ def unified_attention(
                 output_gate=output_gate,
                 output_rows=output_rows,
                 segm_tiles=segm_tiles,
-                min_segment_tiles=min_segment_tiles,
-                skip_single_segment=single_segment_store,
             )
     return final_out
 
@@ -1246,8 +1290,6 @@ def _reduce_segments_triton(
     output_gate=None,
     output_rows=None,
     segm_tiles=None,
-    min_segment_tiles=0,
-    skip_single_segment=False,
 ):
     head_size_padded = triton.next_power_of_2(params.head_size)
     config = get_unified_attention_config("reduce", params, backend="triton")
@@ -1280,14 +1322,52 @@ def _reduce_segments_triton(
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         TILE_SIZE=TILE_SIZE,
         SLIDING_WINDOW=params.sliding_window,
-        MIN_SEGMENT_TILES=min_segment_tiles,
-        SKIP_SINGLE_SEGMENT=skip_single_segment,
         BLOCK_Q=None,
         gate_ptr=output_gate,
         gate_stride_0=output_gate.stride(0) if output_gate is not None else None,
         rows_ptr=output_rows,
         **config,
         enable_fp_fusion=True,
+    )
+
+
+def _reduce_segments_one_block_gfx950(
+    params: _UAParams,
+    segm_output,
+    segm_max,
+    segm_expsum,
+    NUM_SEGMENTS,
+    TILE_SIZE,
+    min_segment_tiles,
+    single_segment_store,
+    output_gate=None,
+):
+    """Merge the gfx950 one-block split on its producer's grid (see
+    reduce_segments_one_block)."""
+    rows = _GFX950_ONE_BLOCK_REDUCE_ROWS
+    row_blocks = triton.cdiv(int(params.max_seqlen_q) * params.num_queries_per_kv, rows)
+    reduce_segments_one_block[(params.num_seqs, params.num_kv_heads, row_blocks)](
+        output_ptr=params.out,
+        segm_output_ptr=segm_output,
+        segm_max_ptr=segm_max,
+        segm_expsum_ptr=segm_expsum,
+        seq_lens_ptr=params.seqused_k,
+        query_start_len_ptr=params.cu_seqlens_q,
+        out_scale_ptr=params.output_scale,
+        output_stride_0=params.out.stride(0),
+        output_stride_1=params.out.stride(1),
+        NUM_QUERY_HEADS=params.num_query_heads,
+        NUM_QUERIES_PER_KV=params.num_queries_per_kv,
+        NUM_SEGMENTS=NUM_SEGMENTS,
+        TILE_SIZE=TILE_SIZE,
+        MIN_SEGMENT_TILES=min_segment_tiles,
+        V_HEAD_SIZE=params.head_size_v,
+        V_HEAD_SIZE_PADDED=triton.next_power_of_2(params.head_size_v),
+        ROWS=rows,
+        SKIP_SINGLE_SEGMENT=single_segment_store,
+        gate_ptr=output_gate,
+        gate_stride_0=output_gate.stride(0) if output_gate is not None else None,
+        num_warps=_GFX950_ONE_BLOCK_REDUCE_WARPS,
     )
 
 

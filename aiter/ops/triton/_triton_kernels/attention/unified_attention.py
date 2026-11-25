@@ -1068,9 +1068,6 @@ def reduce_segments(
     SEGMENT_BLOCK: tl.constexpr = 0,  # segments per merge step, 0 = all at once
     BLOCK_D: tl.constexpr = 0,  # head-dim slice per program (grid axis 2), 0 = all
     SLIDING_WINDOW: tl.constexpr = 0,  # int, the producer's; carves its window
-    MIN_SEGMENT_TILES: tl.constexpr = 0,  # the producer's floor on tiles per segment
-    # the producer stored the output of a sequence that fits one segment
-    SKIP_SINGLE_SEGMENT: tl.constexpr = False,
     # Epilogue (Qwen3-Next / Qwen3.5 attention output gate): out * sigmoid(gate),
     # gate [num_tokens, num_query_heads * V_HEAD_SIZE], rounded as the unfused ops.
     # (None without the gate: a constexpr, so the ungated kernel keeps its arguments)
@@ -1085,16 +1082,6 @@ def reduce_segments(
     else:
         query_token_idx = out_row_idx
     query_head_idx = tl.program_id(1)
-
-    if SKIP_SINGLE_SEGMENT:
-        # the producer marks segment 0's max +inf where it stored the output
-        mark = tl.load(
-            segm_max_ptr
-            + query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
-            + query_head_idx * NUM_SEGMENTS_PER_SEQ
-        )
-        if mark == float("inf"):
-            return
 
     out_scale = None
     if out_scale_ptr is not None:
@@ -1126,8 +1113,6 @@ def reduce_segments(
         act_num_segments = cdiv_fn(window_tiles, tiles_per_segment)
     else:
         tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
-        if MIN_SEGMENT_TILES > 0:
-            tiles_per_segment = tl.maximum(tiles_per_segment, MIN_SEGMENT_TILES)
         # create masks for subsequent loads
         act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
     single_tile: tl.constexpr = (
