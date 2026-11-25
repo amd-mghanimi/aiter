@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
 import random
 import sys
 from types import SimpleNamespace
@@ -26,9 +27,13 @@ from aiter.test_common import checkAllclose
 from op_tests.triton_tests.quant.test_quant_mxfp4 import (
     torch_dynamic_mxfp4_quant,
 )
+from op_tests.triton_tests.utils.test_common_utils import (
+    assert_no_gpu_memory_fault,
+    run_in_subprocess,
+)
 
 DEVICE_ARCH = arch_info.get_arch()
-IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
+IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
 
 
 def shuffle_kv_cache(
@@ -436,6 +441,7 @@ def test_triton_unified_attn_3d(
     if DEVICE_ARCH not in (
         "gfx950",
         "gfx1250",
+        "gfx1250-strict",
     ):
         # gfx1250 -> Gluon
         # gfx950 -> Gluon
@@ -444,7 +450,7 @@ def test_triton_unified_attn_3d(
     if force_fp8_pv and kv_dtype != torch.uint8:
         pytest.skip("force_fp8_pv_on_fp4_kv_cache only applies to an NVFP4 KV cache")
     if kv_dtype == torch.uint8:
-        if DEVICE_ARCH not in ("gfx1250",):
+        if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
             pytest.skip(f"NVFP4 KV cache requires {DEVICE_ARCH}")
         if not shuffled_kv_cache:
             pytest.skip("NVFP4 KV cache requires shuffled KV cache")
@@ -773,7 +779,7 @@ def test_triton_unified_attn(
 def test_triton_unified_attn_qq_bias_padded_query_rows(
     num_heads: tuple[int, int], query_len: int, kv_len: int
 ) -> None:
-    if DEVICE_ARCH == "gfx1250":
+    if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
         pytest.skip("gfx1250 Gluon kernel does not mask padded qq_bias rows")
     seq_lens = [(query_len, kv_len)] * 2
     (
@@ -1165,6 +1171,108 @@ def test_triton_unified_attn_asym_head(
     )
 
 
+# gfx950 gives head sizes 129-256 their own attn_2d prefill entries; 320 is the
+# first size past them. The prefills are long enough to run the 2D kernel.
+@pytest.mark.parametrize(
+    "seq_lens",
+    [[(1100, 2048)], [(1, 1500), (777, 1200), (600, 600)]],
+)
+@pytest.mark.parametrize("head_size", [160, 192, 256, 320])
+@pytest.mark.parametrize("sliding_window", [None, 512])
+@pytest.mark.parametrize(
+    "q_dtype, kv_dtype",
+    [
+        (torch.bfloat16, torch.bfloat16),
+        (torch.bfloat16, e4m3_dtype),
+        (e4m3_dtype, e4m3_dtype),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_prefill_head_sizes(
+    seq_lens: list[tuple[int, int]],
+    head_size: int,
+    sliding_window: int | None,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+) -> None:
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=2048,
+        block_size=64,
+        head_size=head_size,
+        num_heads=(16, 2),
+        sliding_window=sliding_window,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+    )
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks,
+        output_scale=output_scale,
+        backend="triton",
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[x[0] for x in seq_lens],
+        kv_lens=[x[1] for x in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        sliding_window=sliding_window,
+        sinks=sinks,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+
+    atol, rtol = 1.5e-2, 1e-2
+    if q_dtype != torch.bfloat16 or kv_dtype != torch.bfloat16:
+        atol, rtol = 1.5e-1, 1.5e-1
+    torch.testing.assert_close(
+        output.to(torch.float32), ref_output.to(torch.float32), atol=atol, rtol=rtol
+    )
+
+
 @pytest.mark.parametrize("case", ["shuffled_kv_cache", "out_qk_width"])
 @torch.inference_mode()
 def test_triton_unified_attn_asym_head_guards(case: str) -> None:
@@ -1310,6 +1418,213 @@ def test_triton_unified_attn_packed_kv_over_2gib(backend: str) -> None:
     torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
 
 
+# Sequence lengths that are not a multiple of the 64-token tile, so with 16-token
+# pages the last tile of each sequence overhangs its last page; 64-token pages
+# take the one-page-per-tile loader. The block table is padded with 0 and block
+# 0 holds NaN: the kernel must not gather K/V from block-table entries past a
+# sequence's pages.
+@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, e4m3_dtype])
+@pytest.mark.parametrize("shuffled_kv_cache", [False, True])
+@pytest.mark.parametrize("query_len", [1, 64])
+@torch.inference_mode()
+def test_unified_attn_padded_block_table_gfx950(
+    block_size: int,
+    dtype: torch.dtype,
+    shuffled_kv_cache: bool,
+    query_len: int,
+) -> None:
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 gluon")
+    seq_lens = [(query_len, kv_len) for kv_len in (66, 130, 201, 333)]
+    kv_lens_list = [kv_len for _, kv_len in seq_lens]
+    pages = [(kv_len + block_size - 1) // block_size for kv_len in kv_lens_list]
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        _,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        _,
+        _,
+        _,
+        q_descale,
+        k_descale,
+        v_descale,
+        _,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=1 + sum(pages),
+        block_size=block_size,
+        head_size=128,
+        num_heads=(16, 2),
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        out_dtype=torch.bfloat16,
+        shuffled_kv_cache=shuffled_kv_cache,
+    )
+    # Pages 1, 2, ... in order; block 0 only in the padding of each row.
+    block_tables = torch.zeros(
+        len(seq_lens), max(pages) + 4, dtype=torch.int32, device="cuda"
+    )
+    first = 1
+    for i, n in enumerate(pages):
+        block_tables[i, :n] = torch.arange(
+            first, first + n, dtype=torch.int32, device="cuda"
+        )
+        first += n
+
+    def run(block0_fill: float) -> torch.Tensor:
+        key_cache[0] = block0_fill
+        value_cache[0] = block0_fill
+        out = torch.empty_like(output)
+        unified_attention(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=out,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_kv_len,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=block_tables,
+            softcap=0,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            shuffled_kv_cache=shuffled_kv_cache,
+            backend="gluon",
+        )
+        return out
+
+    # Bitwise, not just a NaN check: with fp8 a stale read changes the output
+    # without making it NaN, by less than the fp8 tolerance.
+    actual = run(float("nan"))
+    assert torch.equal(actual, run(0.0)), "the kernel read block 0 past a sequence"
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[q for q, _ in seq_lens],
+        kv_lens=kv_lens_list,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=actual.dtype,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    ).to(torch.float32)
+    actual = actual.to(torch.float32)
+    if dtype.itemsize == 1:
+        # As test_triton_unified_attn: fp8 with descales allows 0.5% of elements out.
+        assert (
+            checkAllclose(
+                actual,
+                ref_output,
+                atol=1.5e-1,
+                rtol=1.5e-1,
+                tol_err_ratio=0.005,
+                msg="unified_attn padded block table",
+            )
+            < 0.005
+        )
+    else:
+        torch.testing.assert_close(actual, ref_output, atol=1.5e-2, rtol=1e-2)
+
+
+def _run_block_table_before_unmapped_page(seq_lens, block_size, sliding_window):
+    # Runs in a child process: a GPU memory fault aborts the whole process.
+    from op_tests.test_batch_prefill import make_guarded_int32_tensor
+
+    query_lens = [q for q, _ in seq_lens]
+    kv_lens = [kv for _, kv in seq_lens]
+    q, k, v, _, _, _, out, cu_q, kv_lens_t, max_q, max_k, scale, window, table = (
+        generate_data(
+            seq_lens,
+            num_blocks=len(seq_lens) * -(-max(kv_lens) // block_size),
+            block_size=block_size,
+            head_size=128,
+            num_heads=(48, 8),
+            sliding_window=sliding_window,
+        )[:14]
+    )
+    # The last sequence fills the last row, so a read past the row is a read
+    # past the table, and the page after the table is not mapped.
+    assert -(-kv_lens[-1] // block_size) == table.shape[1]
+    guarded = make_guarded_int32_tensor(table, device=torch.cuda.current_device())
+    unified_attention(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        cu_seqlens_q=cu_q,
+        seqused_k=kv_lens_t,
+        max_seqlen_q=max_q,
+        max_seqlen_k=max_k,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window,
+        block_table=guarded.view(table.shape),
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        backend="gluon",
+    )
+    torch.cuda.synchronize()
+    ref = ref_paged_attn(
+        q, k, v, query_lens, kv_lens, table, scale, torch.bfloat16, sliding_window
+    )
+    torch.testing.assert_close(out, ref, atol=1.5e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # speculative-decoding verify: the last sequence ends 6 tokens short of the row
+        [(8, 1000), (8, 2045), (6, 4090)],
+        [(512, 512), (256, 4096)],
+        [(1, 1000), (1, 4096)],
+    ],
+)
+@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("sliding_window", [None, 512])
+def test_triton_unified_attn_block_table_before_unmapped_page(
+    seq_lens, block_size, sliding_window
+):
+    # The gfx950 kernel loads block IDs two tiles ahead. The load must stay in
+    # the block table also for the last row of the table.
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 gluon block-table prefetch")
+    aiter_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    )
+    child = (
+        "import sys, torch\n"
+        f"sys.path.insert(0, {aiter_root!r})\n"
+        "from op_tests.triton_tests.attention.test_unified_attention import "
+        "_run_block_table_before_unmapped_page as run\n"
+        "with torch.inference_mode():\n"
+        f"    run({seq_lens!r}, {block_size!r}, {sliding_window!r})\n"
+    )
+    result = run_in_subprocess(child, timeout=600)
+    assert_no_gpu_memory_fault(
+        result, "unified attention read past the end of the block table"
+    )
+
+
 def _spec_verify_seq_lens(batch: int, max_query_len: int, seed: int):
     """Verify-step batch: mixed query lengths up to 1 + num_spec, mixed contexts."""
     rng = random.Random(seed)
@@ -1341,7 +1656,7 @@ def test_unified_attn_spec_verify_gfx1250(
     split-KV kernel, where query rows of one block have different causal horizons
     so a split segment can be partly or wholly past a row's horizon, and the 2D
     kernel with a BLOCK_M sized to the query rows."""
-    if DEVICE_ARCH != "gfx1250":
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("gfx1250 Gluon kernels")
     if path != "auto":
         monkeypatch.setattr(
@@ -1440,7 +1755,7 @@ def test_unified_attn_equal_seqlen_q_gfx1250(
     BLOCK_M), both KV layouts, and trailing pad seqs as a DP-padded batch has
     them: no query rows behind them and seqused_k == 0, which must neither
     shift the real seqs' rows nor write past them."""
-    if DEVICE_ARCH != "gfx1250":
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("gfx1250 Gluon kernels")
     if path == "3d" and not shuffled_kv_cache:
         pytest.skip("the gfx1250 3D Gluon kernel needs the shuffled KV cache")
@@ -1550,7 +1865,7 @@ def test_unified_attn_equal_seqlen_q_gfx1250(
 def test_unified_attn_attn_work_gfx1250(seq_lens, with_hint: bool) -> None:
     """The optional attn_work hint (sum of q x (k - q / 2)) only steers the gfx1250
     prefill routing and config; the output must match the reference either way."""
-    if DEVICE_ARCH != "gfx1250":
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("gfx1250 Gluon kernels")
     block_size, head_size, num_heads = 64, 256, (4, 1)
     (
@@ -1862,7 +2177,7 @@ def test_triton_unified_attn_k4v8(
     min(128, page) rows) and fp8 V (shuffled), through the 2D and 3D kernels. The reference reads the dequantized
     K and the fp8 V with its descale; P is fp8 in the PV WMMA, as for A8W8, so the bound is on the relative L2.
     """
-    if DEVICE_ARCH != "gfx1250":
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("A8K4V8 runs on the gfx1250 Gluon kernels")
     from op_tests.op_benchmarks.triton import bench_unified_attention as bench
 
@@ -2056,7 +2371,7 @@ def test_unified_attn_output_gate_k4v8(
     select=True: only each sequence's last row (as the MTP drafter keeps), which the 2D
     kernel never fuses, so it runs the output epilogue; on the cu_seqlens_q search path.
     """
-    if DEVICE_ARCH != "gfx1250":
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("A8K4V8 runs on the gfx1250 Gluon kernels")
     module = sys.modules[unified_attention.__module__]
     if path != "auto":
@@ -2181,7 +2496,7 @@ def test_unified_attn_split_rebalance_reduce_k4v8(
     the bf16 outputs match to within 2 ulps of the output (1e-6 of the values that
     differ), and the gate / row-selection epilogue is bitwise the Triton reduce's
     epilogue applied to the new reduce."""
-    if DEVICE_ARCH != "gfx1250":
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("A8K4V8 runs on the gfx1250 Gluon kernels")
     from op_tests.op_benchmarks.triton import bench_unified_attention as bench
 
@@ -2309,7 +2624,7 @@ def test_unified_attn_split_rebalance_reduce_configs_k4v8(
     merge steps in the same order), on the 3D kernel's own partials under the gfx1250
     split rebalance, with and without the gate / row-selection epilogue, speculative or
     not, over one or several LDS passes."""
-    if DEVICE_ARCH != "gfx1250":
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("A8K4V8 runs on the gfx1250 Gluon kernels")
     from op_tests.op_benchmarks.triton import bench_unified_attention as bench
 
@@ -2416,50 +2731,48 @@ def test_unified_attn_split_rebalance_reduce_configs_k4v8(
 
 
 class _LaunchSpy:
-    """Forward each launch to the real kernel and record its grid and ONE_Q_BLOCK."""
+    """Forward each launch to the real kernel and record its grid, ONE_Q_BLOCK and NUM_SPLITS.
 
-    def __init__(self, kernel, launches):
+    With floors, also record each launch's MIN_SEGMENT_TILES there."""
+
+    def __init__(self, kernel, launches, floors=None):
         self._kernel = kernel
         self._launches = launches
+        self._floors = floors
 
     def __getitem__(self, grid):
         launch = self._kernel[grid]
 
         def run(*args, **kwargs):
-            self._launches.append((tuple(grid), kwargs["ONE_Q_BLOCK"]))
+            self._launches.append(
+                (tuple(grid), kwargs["ONE_Q_BLOCK"], kwargs["NUM_SPLITS"])
+            )
+            if self._floors is not None:
+                self._floors.append(kwargs["MIN_SEGMENT_TILES"])
             return launch(*args, **kwargs)
 
         return run
 
 
-@pytest.mark.parametrize(
-    "seq_lens, num_heads, head_size, block_size",
-    [
-        # max query length 2: one query block per sequence, 3d path for 5000 keys
-        ([(2, 300), (1, 1000), (2, 40), (1, 17), (2, 5000)], (16, 2), 128, 16),
-        ([(2, 96)], (16, 2), 128, 16),
-        # max_seqlen_q == BLOCK_Q: q * qpkv = 32 is a power of two and the launch splits
-        ([(4, 4096)] * 4, (16, 2), 128, 16),
-        # a zero-length sequence sits between the others in the search
-        ([(1, 64), (8, 512), (0, 33), (3, 7)], (8, 8), 64, 64),
-        ([(8, 5000), (1, 9)], (8, 8), 128, 16),
-    ],
-)
-@pytest.mark.parametrize(
-    "q_dtype, use_descale",
-    [(torch.bfloat16, False), (e4m3_dtype, True)],
-)
-@torch.inference_mode()
-def test_triton_unified_attn_one_q_block(
-    seq_lens, num_heads, head_size, block_size, q_dtype, use_descale, monkeypatch
+def _run_one_q_block(
+    seq_lens,
+    num_heads,
+    head_size,
+    block_size,
+    q_dtype,
+    use_descale,
+    monkeypatch,
+    max_seqlen_k=None,
+    floors=None,
+    epilogue=None,
 ):
-    """Short batches launch one query block per sequence, and the output is correct.
+    """Run unified_attention on the gfx950 gluon kernel and check it against the reference.
 
-    The launch is checked directly: every launch must set ONE_Q_BLOCK and use
-    grid[1] == num_seqs.
+    max_seqlen_k, when given, replaces the longest key length as the call's bound
+    (as a CUDA-graph caller passes it). epilogue "gate" passes an output gate,
+    "rows" an output_rows selection. Returns the recorded launches as
+    (grid, ONE_Q_BLOCK, NUM_SPLITS).
     """
-    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
-        pytest.skip("gfx950 gluon one-query-block launch")
     query_lens = [q for q, _ in seq_lens]
     kv_lens_list = [kv for _, kv in seq_lens]
     (
@@ -2500,8 +2813,30 @@ def test_triton_unified_attn_one_q_block(
     monkeypatch.setattr(
         module,
         "_unified_attention_kernel_gfx950",
-        _LaunchSpy(module._unified_attention_kernel_gfx950, launches),
+        _LaunchSpy(module._unified_attention_kernel_gfx950, launches, floors),
     )
+    num_tokens, num_query_heads = query.shape[0], query.shape[1]
+    epilogue_kwargs = {}
+    if epilogue == "gate":
+        gen = torch.Generator(device="cuda").manual_seed(0)
+        epilogue_kwargs["output_gate"] = (
+            3
+            * torch.randn(
+                num_tokens, num_query_heads * head_size, generator=gen, device="cuda"
+            )
+        ).to(torch.bfloat16)
+    elif epilogue == "rows":
+        gen = torch.Generator(device="cuda").manual_seed(0)
+        epilogue_kwargs["output_rows"] = torch.randperm(
+            num_tokens, generator=gen, device="cuda"
+        )[: max(1, num_tokens // 3)]
+        output = torch.empty(
+            epilogue_kwargs["output_rows"].numel(),
+            num_query_heads,
+            head_size,
+            dtype=output.dtype,
+            device="cuda",
+        )
     unified_attention(
         q=query,
         k=key_cache,
@@ -2510,7 +2845,7 @@ def test_triton_unified_attn_one_q_block(
         cu_seqlens_q=cu_query_lens,
         seqused_k=kv_lens,
         max_seqlen_q=max_query_len,
-        max_seqlen_k=max_kv_len,
+        max_seqlen_k=max_kv_len if max_seqlen_k is None else max_seqlen_k,
         softmax_scale=scale,
         causal=True,
         window_size=window_size,
@@ -2519,12 +2854,10 @@ def test_triton_unified_attn_one_q_block(
         q_descale=q_descale,
         k_descale=k_descale,
         v_descale=v_descale,
+        **epilogue_kwargs,
     )
 
     assert launches, "the gfx950 gluon kernel did not launch"
-    for grid, one_q_block in launches:
-        assert one_q_block, "short batch did not take the one-query-block launch"
-        assert grid[1] == len(seq_lens), f"grid {grid}: want one program per sequence"
 
     ref = ref_paged_attn(
         query=query,
@@ -2539,6 +2872,11 @@ def test_triton_unified_attn_one_q_block(
         k_descale=k_descale,
         v_descale=v_descale,
     ).float()
+    if epilogue == "gate":
+        gate = epilogue_kwargs["output_gate"].float().sigmoid().to(torch.bfloat16)
+        ref = (ref.to(torch.bfloat16) * gate.view_as(ref)).float()
+    elif epilogue == "rows":
+        ref = ref[epilogue_kwargs["output_rows"]]
     out = output.float()
     if use_descale:
         # NaN > x is false, so an all-NaN fp8 output would pass the budget below
@@ -2553,6 +2891,178 @@ def test_triton_unified_attn_one_q_block(
         )
     else:
         torch.testing.assert_close(out, ref, atol=1.5e-2, rtol=1e-2)
+    return launches
+
+
+@pytest.mark.parametrize(
+    "seq_lens, num_heads, head_size, block_size",
+    [
+        # max query length 2: one query block per sequence, 3d path for 5000 keys
+        ([(2, 300), (1, 1000), (2, 40), (1, 17), (2, 5000)], (16, 2), 128, 16),
+        ([(2, 96)], (16, 2), 128, 16),
+        # max_seqlen_q == BLOCK_Q: q * qpkv = 32 is a power of two and the launch splits
+        ([(4, 4096)] * 4, (16, 2), 128, 16),
+        # a zero-length sequence sits between the others in the search
+        ([(1, 64), (8, 512), (0, 33), (3, 7)], (8, 8), 64, 64),
+        ([(8, 5000), (1, 9)], (8, 8), 128, 16),
+    ],
+)
+@pytest.mark.parametrize(
+    "q_dtype, use_descale",
+    [(torch.bfloat16, False), (e4m3_dtype, True)],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_one_q_block(
+    seq_lens, num_heads, head_size, block_size, q_dtype, use_descale, monkeypatch
+):
+    """Short batches launch one query block per sequence, and the output is correct.
+
+    The launch is checked directly: every launch must set ONE_Q_BLOCK and use
+    grid[1] == num_seqs.
+    """
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 gluon one-query-block launch")
+    launches = _run_one_q_block(
+        seq_lens, num_heads, head_size, block_size, q_dtype, use_descale, monkeypatch
+    )
+    for grid, one_q_block, _num_splits in launches:
+        assert one_q_block, "short batch did not take the one-query-block launch"
+        assert grid[1] == len(seq_lens), f"grid {grid}: want one program per sequence"
+
+
+@pytest.mark.parametrize(
+    "num_seqs, kv_len, num_splits",
+    [
+        # The split lookup starts from BLOCK_Q=1 (16 queries per KV head, BLOCK_M 16),
+        # so the padded count is 256 tokens // 1 + 64 seqs = 320 per KV head, 640
+        # programs for 2 KV heads: more than the 256 CUs, so the launch stays unsplit.
+        # The one-block grid is 64 * 2 = 128 programs, half the CUs. Counting it is
+        # what makes this launch split: 4 segments, the 4 that 8192 keys fill at
+        # the segment floor (2048 keys for 128 programs on 256 CUs).
+        (64, 8192, 4),
+        # at 2048 keys one segment holds the whole sequence: no split
+        (64, 2048, 1),
+        # padded: 32 // 1 + 8 = 40 per KV head, 80 programs. That already splits (8),
+        # so it is kept. Counting the one-block grid (16 programs) as well would give
+        # 32 segments instead of 8.
+        (8, 8192, 8),
+        # padded: 1024 // 1 + 256 = 1280 per KV head, 2560 programs. One-block: 512.
+        # Both fill the CUs: nothing to split.
+        (256, 1024, 1),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_one_q_block_split_transition(
+    num_seqs, kv_len, num_splits, monkeypatch
+):
+    """The one-block grid is counted for the split only while the padded count leaves
+    the launch unsplit (Qwen3.5-397B bf16: -hq 32 -hk 2 -d 256 -sq 4).
+
+    Checks the exact NUM_SPLITS of the launch, on top of the one-block launch and
+    the output. The counts are the kv_split table's for 256 CUs.
+    """
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 gluon one-query-block launch")
+    if torch.cuda.get_device_properties(0).multi_processor_count != 256:
+        pytest.skip("the split counts are for 256 CUs")
+    launches = _run_one_q_block(
+        [(4, kv_len)] * num_seqs,
+        (32, 2),
+        256,
+        16,
+        torch.bfloat16,
+        False,
+        monkeypatch,
+    )
+    assert len(launches) == 1, f"want one launch, got {launches}"
+    grid, one_q_block, launched_splits = launches[0]
+    assert one_q_block, "short batch did not take the one-query-block launch"
+    assert launched_splits == num_splits, f"grid {grid}: want {num_splits} splits"
+    assert grid == (2, num_seqs) + ((num_splits,) if num_splits > 1 else ())
+
+
+@pytest.mark.parametrize(
+    "q_dtype, use_descale, query_len, num_seqs, max_seqlen_k, floored",
+    [
+        # the split counts the one-block grid (see the transition test above), so
+        # each sequence fills only the segments its live length sustains
+        (torch.bfloat16, False, 4, 64, None, True),
+        # a CUDA-graph bound: the split sizes off 65536 keys, the floor off the
+        # live lengths
+        (torch.bfloat16, False, 4, 64, 65536, True),
+        # the padded count already splits: that split is kept as is, no floor
+        (torch.bfloat16, False, 4, 8, None, False),
+        # fp8 Q and KV take the transition at 8 queries per sequence
+        (e4m3_dtype, True, 8, 64, None, True),
+        (e4m3_dtype, True, 8, 64, 65536, True),
+        (e4m3_dtype, True, 4, 64, None, False),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_one_q_block_segment_floor(
+    q_dtype, use_descale, query_len, num_seqs, max_seqlen_k, floored, monkeypatch
+):
+    """The one-block split floors each segment at the live length, and the output is
+    correct for sequences that fill one, a few, or all of the segments.
+
+    The live lengths sit on and around the floor's segment boundaries.
+    """
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 gluon one-query-block launch")
+    if torch.cuda.get_device_properties(0).multi_processor_count != 256:
+        pytest.skip("the split counts are for 256 CUs")
+    kv_lens = [17, 1000, 4095, 4096, 4097, 6000, 8191, 8192]
+    floors = []
+    launches = _run_one_q_block(
+        [(query_len, kv_lens[i % len(kv_lens)]) for i in range(num_seqs)],
+        (32, 2),
+        256,
+        16,
+        q_dtype,
+        use_descale,
+        monkeypatch,
+        max_seqlen_k=max_seqlen_k,
+        floors=floors,
+    )
+    assert len(launches) == 1, f"want one launch, got {launches}"
+    grid, one_q_block, num_splits = launches[0]
+    assert one_q_block, "short batch did not take the one-query-block launch"
+    assert num_splits > 1, f"grid {grid}: want a split launch"
+    assert (floors[0] > 0) == floored, f"MIN_SEGMENT_TILES {floors[0]}"
+
+
+@pytest.mark.parametrize("max_seqlen_k", [None, 65536])
+@pytest.mark.parametrize("epilogue, floored", [("gate", True), ("rows", False)])
+@torch.inference_mode()
+def test_triton_unified_attn_one_q_block_segment_floor_epilogue(
+    epilogue, floored, max_seqlen_k, monkeypatch
+):
+    """The output gate keeps the floor (reduce_segments_one_block applies it).
+    output_rows is reduce_segments' epilogue, so that launch keeps the split as is.
+    """
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 gluon one-query-block launch")
+    if torch.cuda.get_device_properties(0).multi_processor_count != 256:
+        pytest.skip("the split counts are for 256 CUs")
+    kv_lens = [17, 1000, 4095, 4096, 4097, 6000, 8191, 8192]
+    floors = []
+    launches = _run_one_q_block(
+        [(4, kv_lens[i % len(kv_lens)]) for i in range(64)],
+        (32, 2),
+        256,
+        16,
+        torch.bfloat16,
+        False,
+        monkeypatch,
+        max_seqlen_k=max_seqlen_k,
+        floors=floors,
+        epilogue=epilogue,
+    )
+    assert len(launches) == 1, f"want one launch, got {launches}"
+    grid, one_q_block, num_splits = launches[0]
+    assert one_q_block, "short batch did not take the one-query-block launch"
+    assert num_splits > 1, f"grid {grid}: want a split launch"
+    assert (floors[0] > 0) == floored, f"MIN_SEGMENT_TILES {floors[0]}"
 
 
 class _TritonLaunchSpy:
