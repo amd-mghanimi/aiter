@@ -26,6 +26,7 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.ops.triton.utils.unified_attention_utils import (
     get_dtype_str,
     get_unified_attention_config,
+    kv_split_costs_one_block,
 )
 
 # gfx1250
@@ -149,6 +150,11 @@ _GFX950_LDS_BUDGET = 160 * 1024
 _GFX950_ONE_BLOCK_SEGMENT_MIN_KEYS = 4096
 _GFX950_ONE_BLOCK_SEGMENT_LO_KEYS = 512
 _GFX950_ONE_BLOCK_FULL_FLOOR_FILL = 4
+# A split the kv_split cost model sizes (bf16 head 64) already weighs each
+# segment's cost, so its floor is the one-block floor >> COST_FLOOR_SHIFT, at
+# least COST_FLOOR_MIN_KEYS (two 64-key tiles, the model's segment minimum)
+_GFX950_COST_FLOOR_SHIFT = 2
+_GFX950_COST_FLOOR_MIN_KEYS = 128
 # reduce_segments_one_block: ROWS query rows and WARPS warps per program, one
 # segment per step. A grid under MIN_PROGRAMS is latency-bound: it halves the
 # rows until it reaches MIN_PROGRAMS (or one row), takes SMALL_WARPS, and
@@ -336,9 +342,18 @@ def _gfx950_split_params(params: _UAParams):
         # max_seqlen_k, a bound under CUDA graphs, so each sequence fills only
         # the segments its live length sustains.
         config = get_unified_attention_config("kv_split", params, backend="gluon")
-        if _split_launch_config(config)[0] > 1:
-            return params
         prgms = params.num_seqs * params.num_kv_heads
+        if _split_launch_config(config)[0] > 1:
+            if kv_split_costs_one_block(params):
+                # the cost model sized this split for one block per sequence,
+                # from max_seqlen_k as well: floor it at the live length too
+                keys = _gfx950_one_block_segment_keys(prgms)
+                return params._replace(
+                    min_segment_keys=max(
+                        _GFX950_COST_FLOOR_MIN_KEYS, keys >> _GFX950_COST_FLOOR_SHIFT
+                    )
+                )
+            return params
         return params._replace(
             num_2d_prgms=prgms,
             min_segment_keys=_gfx950_one_block_segment_keys(prgms),
@@ -353,6 +368,75 @@ def _gfx950_split_params(params: _UAParams):
         # the launch shrinks to one query block per sequence (ONE_Q_BLOCK)
         num_q_blocks = params.num_seqs
     return params._replace(num_2d_prgms=num_q_blocks * params.num_kv_heads)
+
+
+def _gfx950_short_query(params: _UAParams):
+    """Short bf16 queries that the split grid launches as one block per sequence.
+
+    The split grid sizes BLOCK_M to the query group, so each sequence is one
+    query block with no masked rows, where the 2d grid's BLOCK_M 128 leaves
+    half of them empty. Measured for head size 64 only, and only while the
+    batch does not oversubscribe the GPU: from SHORT_MAX_PROGRAMS_PER_CU
+    programs per CU (kv_tile) the launch is memory bound, and the split grid's
+    smaller BLOCK_M has fewer warps per program to hide it (gpt-oss, q=8, 512
+    sequences: 11 % slower than the 2d grid).
+    """
+    if not (
+        not params.all_decode
+        and params.q_dtype == torch.bfloat16
+        and params.head_size <= 64
+        and params.max_seqlen_q * params.num_queries_per_kv <= 128
+    ):
+        return False
+    policy = get_unified_attention_config("kv_tile", params, backend="gluon")
+    programs = params.num_seqs * params.num_kv_heads
+    return programs < policy["SHORT_MAX_PROGRAMS_PER_CU"] * params.num_sms
+
+
+def _gfx950_tile_size(params: _UAParams, tile: int):
+    """Widen the KV tile to 128 for full attention when each program walks a
+    long KV run and the grid leaves room on the CUs.
+
+    With 16-token pages both loaders gather per token for a 64-key tile, so a
+    program pays a fixed cost per tile; a 128-key tile halves the tile count.
+    That only pays off over a long run (>= 2048 keys per program, 1536 for
+    short queries on the split grid; shorter runs lose the deeper prologue)
+    and while the wider tile's doubled LDS does not cost co-residency: past
+    one program per CU for decode, and on the 2d grid past one program per CU
+    dense or two shuffled. Short queries on the split grid (see
+    _gfx950_short_query) widen at any program count they are used at. Sliding
+    windows keep the 64-key tile. Measured for bf16 and head size 64 only; at
+    head 256 the wider tile is slower.
+    """
+    if (
+        params.sliding_window > 0
+        or params.q_dtype != torch.bfloat16
+        or params.head_size > 64
+        or params.max_seqlen_q * params.num_queries_per_kv > 128
+    ):
+        return tile
+    # the thresholds and the wide tile size are tuned in configs/ (kv_tile)
+    policy = get_unified_attention_config("kv_tile", params, backend="gluon")
+    num_segments = get_unified_attention_config(
+        "kv_split", _gfx950_split_params(params), backend="gluon"
+    )["NUM_SEGMENTS"]
+    short = _gfx950_short_query(params)
+    min_keys = (
+        policy["TILE_WIDE_MIN_KEYS_SHORT"] if short else policy["TILE_WIDE_MIN_KEYS"]
+    )
+    if params.max_seqlen_k < min_keys * num_segments:
+        return tile
+    programs = params.num_seqs * params.num_kv_heads * num_segments
+    per_cu = policy["TILE_WIDE_PROGRAMS_PER_CU"]
+    if params.all_decode:
+        wide = programs <= per_cu * params.num_sms
+    elif short:
+        wide = True
+    elif params.shuffled_kv_cache:
+        wide = programs < policy["TILE_WIDE_SHUFFLED_PROGRAMS_PER_CU"] * params.num_sms
+    else:
+        wide = programs < per_cu * params.num_sms
+    return max(tile, policy["TILE_WIDE"]) if wide else tile
 
 
 _SW_SPLIT_MAX_Q = 16
@@ -410,6 +494,9 @@ def _gfx12_split_rebalance(params: _UAParams, tile_size: int):
 def _gfx950_split_grid(params: _UAParams):
     """Decode, and batches too small to fill the GPU, take the split grid."""
     if params.all_decode:
+        return True
+    if params.sliding_window <= 0 and _gfx950_short_query(params):
+        # the split grid beats the 2d one (BLOCK_M 128) even unsplit
         return True
     # the split carves only the window, so a full table splits like a trimmed one
     if params.sliding_window > 0 and not (
@@ -805,6 +892,8 @@ def unified_attention(
         # and keeps its tuned tile.
         if shuffled_kv_cache and not use_gluon_3d:
             TILE_SIZE = block_size
+        elif use_gluon_3d and DEVICE_ARCH == "gfx950":
+            TILE_SIZE = _gfx950_tile_size(params, config["TILE_SIZE"])
         else:
             TILE_SIZE = CONFIG_TILE_SIZE
         # skip_reduce hands the caller partials it carves without the floor, and
@@ -1951,7 +2040,7 @@ def _unified_attention_2d_gfx950(params: _UAParams):
         params,
         config,
         BLOCK_M=BLOCK_M,
-        TILE_SIZE=config["TILE_SIZE"],
+        TILE_SIZE=_gfx950_tile_size(params, config["TILE_SIZE"]),
         num_warps=config["num_warps"],
     )
 

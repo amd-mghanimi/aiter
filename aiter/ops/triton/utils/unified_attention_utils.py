@@ -38,6 +38,8 @@ A section with no axes, like reduce above, is just a config.
 Tile size and number of splits (segments) are derived from the following parameters:
 TILE_SIZE_MIN/MAX, and MIN_SEGMENTS/MAX_SEGMENTS/SEGMENTS_PER_CU, plus MFMA_DIM
 and the SPLIT_MIN_* floors; see compute_segment_params.
+
+The gfx950 gluon 128-key tile policy is the flat "kv_tile" section.
 """
 
 import copy
@@ -56,7 +58,7 @@ from aiter.ops.triton.utils.config_utils import (
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 _CONFIG_NAME = "UNIFIED-ATTENTION"
-_OPS = ("attn_2d", "attn_3d", "reduce", "kv_split")
+_OPS = ("attn_2d", "attn_3d", "reduce", "kv_split", "kv_tile")
 
 # Groups of RDNA GPUs have similar hardware. Use the same config file until further investigation shows they diverge.
 _ARCH_ALIAS = {
@@ -223,19 +225,58 @@ def compute_segment_params(config: dict, params) -> dict:
     min_share = config.pop("SPLIT_MIN_SHARE", 0)
     fit_budget = config.pop("SPLIT_FIT_BUDGET", False)
     seqs_per_tile = config.pop("SPLIT_SEQS_PER_TILE", 0)
+    seg_min_tiles = config.pop("SPLIT_SEG_MIN_TILES", 0)
+    wave_slots = config.pop("SPLIT_WAVE_SLOTS_PER_CU", 0)
+    seg_overhead = config.pop("SPLIT_SEG_OVERHEAD_TILES", 0)
+    partial_cost = config.pop("SPLIT_PARTIAL_COST", 0.0)
 
     # tokens one segment must cover, so the split never outruns the context
-    tile = triton.next_power_of_2(params.block_size)
+    tile = triton.next_power_of_2(int(params.block_size))
     tile = max(tile_lo, tile if tile_hi is None else min(tile_hi, tile))
-    kv_len = params.max_seqlen_k
+    kv_len = int(params.max_seqlen_k)
     # a sliding-window split carves only the window: rows see at most
     # window + q - 1 keys
     if params.sliding_window > 0:
-        kv_len = min(kv_len, params.sliding_window + params.max_seqlen_q - 1)
-    limit = triton.cdiv(kv_len, tile)
-    too_many_seqs = seqs_per_tile and params.num_seqs > seqs_per_tile * limit
+        kv_len = min(kv_len, int(params.sliding_window) + int(params.max_seqlen_q) - 1)
+    tiles = triton.cdiv(kv_len, tile)
+    limit = tiles
+    num_seqs = int(params.num_seqs)
+    too_many_seqs = seqs_per_tile and num_seqs > seqs_per_tile * limit
     if cap is not None:
         limit = min(cap, limit)
+
+    q_rows = int(params.max_seqlen_q) * int(params.num_queries_per_kv)
+    if wave_slots and mfma_dim and q_rows <= 128:
+        # One block covers each sequence, so the split grid holds num_seqs *
+        # num_kv_heads programs per segment, each of next_pow2(q_rows) //
+        # mfma_dim waves, and wave_slots waves fill a CU. Programs past one
+        # machine-full wait for another round, so a split costs whole rounds
+        # of (tiles per segment + a fixed per-program overhead), plus its
+        # partials, which grow with the program count. Segments keep at least
+        # seg_min_tiles tiles, and once the unsplit grid fills the machine
+        # twice a split only adds rounds.
+        num_kv_heads = int(params.num_kv_heads)
+        num_sms = int(params.num_sms)
+        waves = max(1, triton.next_power_of_2(q_rows) // mfma_dim)
+        load = num_seqs * num_kv_heads * waves
+        slots = num_sms * wave_slots
+        segments = 1
+        best = float(triton.cdiv(load, slots) * (tiles + seg_overhead))
+        split = 2
+        while (
+            limit > min_tiles
+            and not too_many_seqs
+            and split <= limit
+            and tiles >= split * seg_min_tiles
+            and load < 2 * slots
+        ):
+            cost = triton.cdiv(load * split, slots) * (tiles / split + seg_overhead)
+            cost += partial_cost * load * split / slots
+            if cost < best:
+                segments, best = split, cost
+            split *= 2
+        config["NUM_SEGMENTS"] = segments
+        return config
 
     budget = params.num_sms * per_cu
     prgms = max(1, params.num_2d_prgms)
@@ -423,7 +464,25 @@ def get_unified_attention_config(
     Returns:
         The config, as a fresh deep copy that is safe to mutate.
     """
-    config = _get_unified_attention_config_cached(
+    config = _cached_config(op, params, backend, arch)
+    # NUM_SEGMENTS is derived out here rather than in the cached lookup: it
+    # reads the launch's program count, which is not part of the cache key.
+    return compute_segment_params(copy.deepcopy(config), params)
+
+
+def kv_split_costs_one_block(params, backend: str = "gluon") -> bool:
+    """True when the kv_split entry's cost model (SPLIT_WAVE_SLOTS_PER_CU) sizes
+    this launch's split. That model counts one query block per sequence itself,
+    not num_2d_prgms, and its tiles from max_seqlen_k."""
+    config = _cached_config("kv_split", params, backend, None)
+    q_rows = int(params.max_seqlen_q) * int(params.num_queries_per_kv)
+    return bool(config.get("SPLIT_WAVE_SLOTS_PER_CU") and config.get("MFMA_DIM")) and (
+        q_rows <= 128
+    )
+
+
+def _cached_config(op: str, params, backend: str, arch: str | None) -> dict:
+    return _get_unified_attention_config_cached(
         op,
         # no asymmetric-head configs yet, pick by the wider of the two heads
         max(params.head_size, params.head_size_v),
@@ -443,9 +502,6 @@ def get_unified_attention_config(
             _prefill_axes(params) if op == "attn_2d" and backend == "gluon" else ()
         ),
     )
-    # NUM_SEGMENTS is derived out here rather than in the cached lookup: it
-    # reads the launch's program count, which is not part of the cache key.
-    return compute_segment_params(copy.deepcopy(config), params)
 
 
 def explain(op: str, params, backend: str = "triton", arch: str | None = None) -> str:
