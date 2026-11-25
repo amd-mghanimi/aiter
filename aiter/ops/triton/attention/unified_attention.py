@@ -26,6 +26,7 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.ops.triton.utils.unified_attention_utils import (
     get_dtype_str,
     get_unified_attention_config,
+    kv_split_costs_one_block,
 )
 
 # gfx1250
@@ -149,6 +150,11 @@ _GFX950_LDS_BUDGET = 160 * 1024
 _GFX950_ONE_BLOCK_SEGMENT_MIN_KEYS = 4096
 _GFX950_ONE_BLOCK_SEGMENT_LO_KEYS = 512
 _GFX950_ONE_BLOCK_FULL_FLOOR_FILL = 4
+# A split the kv_split cost model sizes (bf16 head 64) already weighs each
+# segment's cost, so its floor is the one-block floor >> COST_FLOOR_SHIFT, at
+# least COST_FLOOR_MIN_KEYS (two 64-key tiles, the model's segment minimum)
+_GFX950_COST_FLOOR_SHIFT = 2
+_GFX950_COST_FLOOR_MIN_KEYS = 128
 # reduce_segments_one_block: query rows and warps per program
 _GFX950_ONE_BLOCK_REDUCE_ROWS = 16
 _GFX950_ONE_BLOCK_REDUCE_WARPS = 4
@@ -330,9 +336,18 @@ def _gfx950_split_params(params: _UAParams):
         # max_seqlen_k, a bound under CUDA graphs, so each sequence fills only
         # the segments its live length sustains.
         config = get_unified_attention_config("kv_split", params, backend="gluon")
-        if _split_launch_config(config)[0] > 1:
-            return params
         prgms = params.num_seqs * params.num_kv_heads
+        if _split_launch_config(config)[0] > 1:
+            if kv_split_costs_one_block(params):
+                # the cost model sized this split for one block per sequence,
+                # from max_seqlen_k as well: floor it at the live length too
+                keys = _gfx950_one_block_segment_keys(prgms)
+                return params._replace(
+                    min_segment_keys=max(
+                        _GFX950_COST_FLOOR_MIN_KEYS, keys >> _GFX950_COST_FLOOR_SHIFT
+                    )
+                )
+            return params
         return params._replace(
             num_2d_prgms=prgms,
             min_segment_keys=_gfx950_one_block_segment_keys(prgms),

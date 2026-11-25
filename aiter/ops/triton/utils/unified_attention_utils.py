@@ -464,7 +464,25 @@ def get_unified_attention_config(
     Returns:
         The config, as a fresh deep copy that is safe to mutate.
     """
-    config = _get_unified_attention_config_cached(
+    config = _cached_config(op, params, backend, arch)
+    # NUM_SEGMENTS is derived out here rather than in the cached lookup: it
+    # reads the launch's program count, which is not part of the cache key.
+    return compute_segment_params(copy.deepcopy(config), params)
+
+
+def kv_split_costs_one_block(params, backend: str = "gluon") -> bool:
+    """True when the kv_split entry's cost model (SPLIT_WAVE_SLOTS_PER_CU) sizes
+    this launch's split. That model counts one query block per sequence itself,
+    not num_2d_prgms, and its tiles from max_seqlen_k."""
+    config = _cached_config("kv_split", params, backend, None)
+    q_rows = int(params.max_seqlen_q) * int(params.num_queries_per_kv)
+    return bool(config.get("SPLIT_WAVE_SLOTS_PER_CU") and config.get("MFMA_DIM")) and (
+        q_rows <= 128
+    )
+
+
+def _cached_config(op: str, params, backend: str, arch: str | None) -> dict:
+    return _get_unified_attention_config_cached(
         op,
         # no asymmetric-head configs yet, pick by the wider of the two heads
         max(params.head_size, params.head_size_v),
@@ -484,9 +502,6 @@ def get_unified_attention_config(
             _prefill_axes(params) if op == "attn_2d" and backend == "gluon" else ()
         ),
     )
-    # NUM_SEGMENTS is derived out here rather than in the cached lookup: it
-    # reads the launch's program count, which is not part of the cache key.
-    return compute_segment_params(copy.deepcopy(config), params)
 
 
 def explain(op: str, params, backend: str = "triton", arch: str | None = None) -> str:
