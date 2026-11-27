@@ -61,8 +61,14 @@ class MegaMoEV2:
         swiglu_limit: float = 0.0, fanout_masks: tuple[int, ...] = (),
         act: str = "silu", situ_beta: float = 1.0, situ_linear_beta: float = 1.0,
         large_m_state_slots: int = 1, large_m_enabled: bool | None = None,
-        small_m_mtprs: tuple[int, ...] | None = None, routed: bool = False):
+        small_m_mtprs: tuple[int, ...] | None = None, routed: bool = False,
+        post_route_norm: tuple[torch.Tensor, float] | None = None):
     # fmt: on
+        """``post_route_norm=(gain, eps)``: RMS-normalize each route's output
+        with the f32 ``[model_dim]`` gain before the router weight, so forward()
+        returns ``sum_k w_k * rms_norm(gain * y_k)`` (Muse Spark's post-expert
+        norm). Routes travel unweighted and combine applies norm and weight;
+        staged route only. ``post_route_norm_gain`` may be rebound per layer."""
         if quant not in ("a4w4", "a8w4"):
             raise ValueError("MegaMoEV2 quant must be 'a4w4' or 'a8w4'")
         if experts % world_size != 0:
@@ -107,6 +113,19 @@ class MegaMoEV2:
         # built and the plan picks one route per call (see MegaMoEBundlePlan.route_for). Without it the instance
         # holds the staged route only, the memory of a caller that never routes. small_m_mtprs and
         # large_m_enabled pin a route in or out either way.
+        self.post_route_norm_gain = None
+        self._post_route_norm_eps = None
+        self._norm_route_wts = None
+        if post_route_norm is not None:
+            if small_m_mtprs or large_m_enabled:
+                raise ValueError("post_route_norm supports the staged route only")
+            small_m_mtprs, large_m_enabled = (), False
+            gain, eps = post_route_norm
+            self.post_route_norm_gain = gain
+            self._post_route_norm_eps = float(eps)
+            self._unit_wts = torch.ones(
+                self.mtpr, self.topk, dtype=torch.float32, device=self.dev
+            )
         if small_m_mtprs is None:
             small_m_mtprs = DEFAULT_SMALL_M_MTPRS if routed else ()
         if large_m_enabled is None:
@@ -1180,6 +1199,7 @@ class MegaMoEV2:
             return runtime.forward(
                 x_bf16, wts, topk_ids, slice_output=slice_output
             )
+        wts = self._route_weights_for_dispatch(wts)
         run_tokens = check_forward_inputs(
             x_bf16, wts, topk_ids, max_rows=self.mtpr, model_dim=self.model_dim,
             topk=self.topk, device=self.dev,
@@ -1250,6 +1270,7 @@ class MegaMoEV2:
                 stream=stream,
                 slice_output=slice_output,
             )
+        wts = self._route_weights_for_dispatch(wts)
         launch_stream = torch_stream(stream)
         if stream is None:
             return self._run_joint(
@@ -1264,6 +1285,24 @@ class MegaMoEV2:
 
     forward_bf16 = forward
     __call__ = forward
+
+    def _route_weights_for_dispatch(self, wts):
+        """Under post_route_norm, keep the router weights for combine and send
+        the routes unit weights, so GEMM2 writes them unweighted."""
+        if self._post_route_norm_eps is None:
+            return wts
+        if wts.dtype != torch.float32 or not wts.is_contiguous():
+            raise ValueError("post_route_norm needs contiguous float32 router weights")
+        self._norm_route_wts = wts
+        return self._unit_wts[: wts.shape[0]]
+
+    def _combine_post_route_norm(self):
+        if self._post_route_norm_eps is None:
+            return None
+        gain = self.post_route_norm_gain
+        if gain.dtype != torch.float32 or not gain.is_contiguous():
+            raise ValueError("post_route_norm_gain must be contiguous float32")
+        return (self._norm_route_wts, gain, self._post_route_norm_eps)
 
     def _build_fused_stage2(self):
         from .mega_moe_stage2 import (
@@ -1448,6 +1487,7 @@ class MegaMoEV2:
                     enable_weights=False,
                     stage2_p2p_quant=entry.config.p2p_quant,
                     mask_topk_ids=mask_topk_ids,
+                    post_route_norm_eps=self._post_route_norm_eps,
                 )
 
     def _run_fused_stage2(
@@ -1480,6 +1520,7 @@ class MegaMoEV2:
         return comb_op.combine_no_stage1(
             self._g2_combine_placeholder, None, combine_ids, cur_tok=run_tokens,
             enable_weights=False, stage2_p2p_quant=p2p_quant,
+            post_route_norm=self._combine_post_route_norm(),
         )
 
     def _launch_aligned_pair_stage2(self, config: MegaMoEConfig, stream):
@@ -1529,5 +1570,6 @@ class MegaMoEV2:
             cur_tok=run_tokens,
             enable_weights=False,
             stage2_p2p_quant=config.p2p_quant,
+            post_route_norm=self._combine_post_route_norm(),
         )
         return self._stage2_output(result, run_tokens, slice_output)

@@ -10,6 +10,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl.expr import T, const_expr, range_constexpr
+from flydsl.expr import math as fmath
 from flydsl.expr.rocdl import (
     ballot,
     cvt_pk_f32_fp8,
@@ -433,6 +434,8 @@ def make_combine_kernel(
     blockwise_fp8_transport: bool = False,
     max_recv: int | None = None,
     mask_topk_ids: bool = False,
+    post_route_norm: bool = False,
+    post_route_norm_eps: float = 1e-6,
 ):
     """Build the intranode combine ``@flyc.kernel``.
 
@@ -447,7 +450,17 @@ def make_combine_kernel(
     since upstream 16B writes drop under fabric contention. ``max_recv`` is the
     receive-side slot count for sentinel/Stage-3 addressing (defaults to
     ``npes * max_tok_per_rank``; tighter when max_total_recv_tokens set).
+
+    ``post_route_norm`` (fused-upstream Stage 3 only) RMS-normalizes each
+    unweighted route partial ``y_k`` with a per-channel gain before the
+    weighted sum: ``out = sum_k w_k * rms_norm(g * y_k)``, with ``w`` the
+    owner's f32 ``[cur_tok, k]`` route weights at ``addr_route_wts`` and ``g``
+    the f32 ``[hidden_dim]`` gain at ``addr_norm_gain``.
     """
+    if post_route_norm and (not skip_stage1 or zero_copy):
+        raise ValueError("post_route_norm requires skip_stage1=True without zero_copy")
+    if post_route_norm and data_type != torch.bfloat16:
+        raise ValueError("post_route_norm requires external bf16")
     # Contract (op-layer _check_config): fp8_direct_cast => data_type==bf16 and
     # not enable_std_moe. skip_stage1 and zero_copy are independent switches.
     if blockwise_fp8_transport and (not skip_stage1 or data_type != torch.bfloat16):
@@ -475,6 +488,8 @@ def make_combine_kernel(
     else:
         n_i32 = (hidden_dim * hidden_elem_size) // 4
         nbytes = hidden_dim * hidden_elem_size
+    if post_route_norm and n_i32 % 64:
+        raise ValueError(f"post_route_norm needs a multiple of 64 words; got {n_i32}")
 
     # Stage 1/3 strides diverge only under ``fp8_direct_cast``: external
     # bf16 reads/writes vs fp8 staging. Other modes keep transport == external.
@@ -649,6 +664,8 @@ def make_combine_kernel(
         addr_inp_packed_recv_x: fx.Int64,  # expert-major token buffer
         addr_inp_disp_tok_map: fx.Int64,  # dispTokToEpSlotMap (i64[max_recv * top_k])
         addr_inp_disp_wts: fx.Int64,  # dispatch output weights (f32[max_recv * top_k])
+        addr_route_wts: fx.Int64,  # post_route_norm route weights (f32[cur_tok * k])
+        addr_norm_gain: fx.Int64,  # post_route_norm gain (f32[hidden_dim])
         cur_rank_num_token: fx.Int32,  # local token count m_local; Stage-3 loop bound
     ):
         tid = fx.thread_idx.x
@@ -945,6 +962,74 @@ def make_combine_kernel(
             hdim_per_warp = (n_elems + warps_per_tok - 1) // warps_per_tok
         s3_total_work = cur_rank_num_token * warps_per_tok
 
+        # Transport elements per i32 word: blockwise fp8 packs 4, bf16 packs 2.
+        elems_per_i32 = 4 if blockwise_fp8_transport else 2
+        if const_expr(post_route_norm):
+            rsrc_gain = create_buffer_resource_from_addr(addr_norm_gain)
+            rsrc_route_wts = create_buffer_resource_from_addr(addr_route_wts)
+
+        def _gain(ec):
+            return Vec(
+                buffer_load(
+                    rsrc_gain, ec * elems_per_i32, vec_width=elems_per_i32, dtype=T.f32
+                )
+            )
+
+        def _block_scale(rsrc, ec, vld):
+            raw = _maybe_load(
+                rsrc, ec // 8, vld, vec_width=1, dtype=T.i8, cache_modifier=_SLC_CACHE
+            )
+            return (fx.Uint8(raw).to(fx.Uint32).bitcast(fx.Int32) << 23).bitcast(
+                fx.Float32
+            )
+
+        def _route_coefs(tok_id, expert_rsrcs, expert_scale_rsrcs, expert_vlds):
+            """w_k * rsqrt(mean((g * y_k)^2) + eps) for each route slot k. Every
+            warp of a token reads its whole rows, so the coefficients do not
+            depend on the hidden-dim partition."""
+            sumsq = [_zero_accum() for _ in range(experts_per_token)]
+            for j in range_constexpr(n_elems // 64):
+                ec = lane + j * 64
+                g = _gain(ec)
+                for k_slot in range_constexpr(experts_per_token):
+                    v = _to_accum(
+                        _maybe_load(
+                            expert_rsrcs[k_slot],
+                            ec,
+                            expert_vlds[k_slot],
+                            vec_width=1,
+                            dtype=T.i32,
+                            cache_modifier=_SLC_CACHE,
+                        )
+                    )
+                    if const_expr(blockwise_fp8_transport):
+                        v = v * _block_scale(
+                            expert_scale_rsrcs[k_slot], ec, expert_vlds[k_slot]
+                        )
+                    z = v * g
+                    sumsq[k_slot] = sumsq[k_slot] + z * z
+            coefs = []
+            for k_slot in range_constexpr(experts_per_token):
+                s = sumsq[k_slot][0]
+                for e in range_constexpr(1, elems_per_i32):
+                    s = s + sumsq[k_slot][e]
+                for sh in range_constexpr(6):
+                    s = s + s.shuffle_xor(32 >> sh, 64)
+                w = buffer_load(
+                    rsrc_route_wts,
+                    tok_id * experts_per_token + k_slot,
+                    vec_width=1,
+                    dtype=T.f32,
+                )
+                coefs.append(
+                    fx.Float32(w)
+                    * fmath.rsqrt(
+                        s * fx.Float32(1.0 / (n_elems * elems_per_i32))
+                        + fx.Float32(post_route_norm_eps)
+                    )
+                )
+            return coefs
+
         for s3_work_idx in range(global_warp_id, s3_total_work, global_warp_num):
             tok_id = s3_work_idx // warps_per_tok
             part_id = s3_work_idx % warps_per_tok
@@ -1014,6 +1099,12 @@ def make_combine_kernel(
                     )
                     expert_vlds.append(vld_k)
 
+            coefs = None
+            if const_expr(post_route_norm):
+                coefs = _route_coefs(
+                    tok_id, expert_rsrcs, expert_scale_rsrcs, expert_vlds
+                )
+
             # Bind the per-iteration resources as defaults so each definition
             # captures its own iteration's values (also silences B023).
             def _accum_step(
@@ -1023,6 +1114,7 @@ def make_combine_kernel(
                 expert_scale_rsrcs=expert_scale_rsrcs,
                 expert_vlds=expert_vlds,
                 tok_id=tok_id,
+                coefs=coefs,
             ):
                 vals = [[] for _ in range(U)]
                 scales = [[] for _ in range(U)]
@@ -1077,7 +1169,15 @@ def make_combine_kernel(
                     out_step = 256
 
                 for u in range_constexpr(U):
-                    if const_expr(blockwise_fp8_transport):
+                    if const_expr(post_route_norm):
+                        fp32_acc = _zero_accum()
+                        for k_slot in range_constexpr(experts_per_token):
+                            v = _to_accum(vals[u][k_slot])
+                            if const_expr(blockwise_fp8_transport):
+                                v = v * scales[u][k_slot]
+                            fp32_acc = fp32_acc + v * coefs[k_slot]
+                        acc = _from_accum(fp32_acc * _gain(ec_abs + u * 64))
+                    elif const_expr(blockwise_fp8_transport):
                         fp32_acc = _zero_accum()
                         for k_slot in range_constexpr(experts_per_token):
                             fp32_acc = (
@@ -1290,6 +1390,8 @@ def make_combine_jit(
     blockwise_fp8_transport: bool = False,
     max_recv=None,
     mask_topk_ids: bool = False,
+    post_route_norm: bool = False,
+    post_route_norm_eps: float = 1e-6,
 ):
     """Build the JIT launcher for ``make_combine_kernel``. ``data_type`` is the
     external dtype (symmetric I/O); ``fp8_direct_cast`` enables bf16-external /
@@ -1315,6 +1417,8 @@ def make_combine_jit(
         blockwise_fp8_transport=blockwise_fp8_transport,
         max_recv=max_recv,
         mask_topk_ids=mask_topk_ids,
+        post_route_norm=post_route_norm,
+        post_route_norm_eps=post_route_norm_eps,
     )
 
     @flyc.jit
@@ -1337,6 +1441,8 @@ def make_combine_jit(
         addr_inp_packed_recv_x: fx.Int64,
         addr_inp_disp_tok_map: fx.Int64,
         addr_inp_disp_wts: fx.Int64,
+        addr_route_wts: fx.Int64,
+        addr_norm_gain: fx.Int64,
         cur_rank_num_token: fx.Int32,
         stream: Stream = Stream(None),  # noqa: B008
     ):
@@ -1359,6 +1465,8 @@ def make_combine_jit(
             addr_inp_packed_recv_x,
             addr_inp_disp_tok_map,
             addr_inp_disp_wts,
+            addr_route_wts,
+            addr_norm_gain,
             cur_rank_num_token,
         ).launch(
             grid=(block_num, 1, 1),
