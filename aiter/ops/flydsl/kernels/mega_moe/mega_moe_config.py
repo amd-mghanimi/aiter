@@ -175,6 +175,17 @@ class Stage1Config:
     ascale_packed: bool = False
     # FP4 GEMM1 epilogue with 8 columns per lane (SiluQuantEpilogue fp4_v8); needs use_tile_resource.
     epi_fp4_v8: bool = False
+    # Every payload producer CTA draws tasks of every destination from one counter,
+    # instead of num_dispatch_cu / world_size CTAs per destination.  Rank-local: the
+    # chunks and tile publish counts are unchanged.
+    pooled_dispatch: bool = False
+    # GEMM tile order: -1 picks payload-arrival order when one expert holds at least a
+    # quarter of the m-tiles, else sharded tile order; 0 / 1 force sharded / arrival.
+    ready_order: int = -1
+    # Arrival order with one work counter per XCD: XCD x takes n-tiles {x, x+8} of each
+    # ready m-tile (the n-tile set sharded order and static GEMM1 give it), keeping the
+    # experts' W1 slabs in its L2 instead of all 16 n-tiles of every expert in flight.
+    ready_xcd: bool = False
 
 
 def stage1_bundle_identity(config: Stage1Config) -> Stage1Config:
@@ -1167,12 +1178,18 @@ def _tune_muse_spark(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfi
     At 512 the base SBM64 geometry stays ahead under uniform routes.
     The packed A scales drop the K-loop's serial per-byte LDS scale reads and the
     8-column FP4 epilogue the per-pair DS swizzles and byte stores.
+    Pooled payload producers spread a hot destination (all of a rank's rows under
+    expert-local routes) over every producer CTA instead of its 4, and per-XCD
+    arrival-order counters keep each XCD on 2 of the 16 W1 n-slabs.
     """
     if not ctx.apply_fp4 or ctx.mtpr_class != MAX_MTPR_CLASS or not 1024 <= ctx.bucket <= 2048:
         return config
     return _replace_config(
         config,
-        stage1={"sort_block_m": 128, "waves_per_eu_hint": 1, "ascale_packed": True, "epi_fp4_v8": True},
+        stage1={
+            "sort_block_m": 128, "waves_per_eu_hint": 1, "ascale_packed": True, "epi_fp4_v8": True,
+            "pooled_dispatch": True, "ready_xcd": True,
+        },
         stage2={"block_m": 64, "b2stage": True, "deep_a_pipeline": True},
     )
 

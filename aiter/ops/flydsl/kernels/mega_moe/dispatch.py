@@ -9,6 +9,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
+from flydsl.expr.typing import Vector as Vec
 
 from .. import communication_ops_utils as comm_ops
 from ..tensor_shim import buf_copy_load, buf_copy_store, ptr_buf_tensor
@@ -71,6 +72,11 @@ class DispatchSlot(IntEnum):
 
 
 DISPATCH_TABLE_SIZE = max(DispatchSlot) + 1
+
+# Pooled payload task counters, per parity, in WORK_HEAD words the work shards
+# (words 0, 16, ..., 112) leave free.
+POOL_TASK_WORD = 4
+POOL_DONE_WORD = 8
 
 
 @flyc.jit
@@ -1570,9 +1576,15 @@ def emit_dispatch_payload(
     payload_chunk_rows,
     tile_state_stride,
     indexed_payload=False,
+    pooled=False,
+    pool_scratch=None,
 ):
 # fmt: on
-    """Produce independently publishable expert payloads from a compact plan."""
+    """Produce independently publishable expert payloads from a compact plan.
+
+    ``pooled``: producers draw tasks of every destination from one counter
+    (``pool_scratch``: an LDS int32 to broadcast the task index).
+    """
     full_units = fz_n_i32 // 4 // 64
     total_units = (fz_n_i32 // 4 + 63) // 64
     assert payload_chunk_rows > 0 and tile_state_stride > 0
@@ -1654,7 +1666,8 @@ def emit_dispatch_payload(
             fx.Int32(0)
         ]
     fx.barrier()
-    for task_index in range(task0, task_limit, task_stride):
+
+    def _run_task(task_index, destination, destination_ready_rows):
         chunk_id = task_index // fx.Int32(segments_per_destination)
         rotated_segment = task_index - chunk_id * fx.Int32(
             segments_per_destination
@@ -1665,7 +1678,6 @@ def emit_dispatch_payload(
         local_segment = (
             rotated_segment + fx.Int32(segments_per_destination) - rotation
         ) % fx.Int32(segments_per_destination)
-        destination = producer_destination
         (
             selected_mask,
             pair_a,
@@ -1966,3 +1978,61 @@ def emit_dispatch_payload(
                     )
                 _finish_task(chunk_done, segment, num_chunks)
             fx.barrier()
+
+    if const_expr(not pooled):
+        for task_index in range(task0, task_limit, task_stride):
+            _run_task(task_index, producer_destination, destination_ready_rows)
+    else:
+        # Every producer serves every destination: tasks are drawn from one
+        # per-parity counter, interleaved by destination starting with this
+        # rank, so the destination with the most rows spreads over all CTAs.
+        segments = fx.Int32(segments_per_destination)
+        chunk_table = ptr_buf_tensor(
+            dp(DispatchSlot.PAYLOAD_CHUNKS_PER_DESTINATION), fx.Int32
+        )
+        max_chunks = fx.Int32(1)
+        for d in range_constexpr(num_destinations):
+            chunks_d = chunk_table[fx.Int32(d)]
+            max_chunks = (chunks_d > max_chunks).select(chunks_d, max_chunks)
+        pool_tasks = max_chunks * segments * fx.Int32(num_destinations)
+        if tid == fx.Int32(0):
+            for d in range_constexpr(num_destinations):
+                comm_ops.wait_i32_until_equals(
+                    a_plan_ready
+                    + fx.Int64(parity * fx.Int32(num_destinations) + fx.Int32(d)) * 4,
+                    expected,
+                )
+            comm_ops.fence_system_acquire()
+        fx.barrier()
+        a_pool = dp(DispatchSlot.WORK_HEAD) + fx.Int64(POOL_TASK_WORD * 4) + fx.Int64(parity) * 4
+        a_pool_done = dp(DispatchSlot.WORK_HEAD) + fx.Int64(POOL_DONE_WORD * 4) + fx.Int64(parity) * 4
+        pool_view = fx.make_view(pool_scratch, fx.make_layout(1, 1))
+        pool_active = pool_tasks > fx.Int32(0)
+        while pool_active:
+            task_lane = fx.Int32(0)
+            if tid == fx.Int32(0):
+                task_lane = fx.Int32(comm_ops.atomic_add_agent(a_pool, fx.Int32(1)))
+                fx.ptr_store(Vec.from_elements([task_lane], fx.Int32), pool_scratch)
+            fx.barrier()
+            pool_task = Vec(pool_view.load())[0]
+            fx.barrier()
+            if pool_task < pool_tasks:
+                local_task = pool_task // fx.Int32(num_destinations)
+                destination = (
+                    pool_task - local_task * fx.Int32(num_destinations) + fx.Int32(fz_rank)
+                ) % fx.Int32(num_destinations)
+                if local_task < segments * chunk_table[destination]:
+                    ready_rows = fx.Int32(0)
+                    if tid == fx.Int32(0):
+                        ready_rows = ptr_buf_tensor(
+                            payload_ready_rows_table[destination], fx.Int32
+                        )[fx.Int32(0)]
+                    _run_task(local_task, destination, ready_rows)
+            pool_active = pool_task < pool_tasks
+        if tid == fx.Int32(0):
+            done = fx.Int32(comm_ops.atomic_add_agent(a_pool_done, fx.Int32(1)))
+            if done == fx.Int32(dispatch_blocks - 1):
+                # Last producer out: the parity's counters are idle until two
+                # invocations later, after this kernel has completed.
+                comm_ops.store_i32_system(a_pool, fx.Int32(0), fx.Int32(0))
+                comm_ops.store_i32_system(a_pool_done, fx.Int32(0), fx.Int32(0))
