@@ -213,6 +213,11 @@ class Stage2Config:
     pair_block_m: int = 32
     pair_block_n: int = 256
     deep_a_pipeline: bool = False
+    # Blockwise P2P rows: stage the row scales rank-locally and send each row's scale line whole from a
+    # follow-up pass (compile_mega_moe_stage2 scale_fwd_rows) instead of every n-block storing its part remotely.
+    scale_forward: bool = False
+    # skew_cu > 0: unskewed routes still take strided m-blocks (compile_mega_moe_stage2 skew_normal_strided).
+    skew_normal_strided: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1181,6 +1186,9 @@ def _tune_muse_spark(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfi
     Pooled payload producers spread a hot destination (all of a rank's rows under
     expert-local routes) over every producer CTA instead of its 4, and per-XCD
     arrival-order counters keep each XCD on 2 of the 16 W1 n-slabs.
+    Stage2 is bound by its remote stores, a third of that by the 16 n-blocks' partial writes into each row's
+    one E8M0 scale line, so it stages the scales and sends each line whole (scale_forward); unskewed routes
+    keep strided m-blocks under skew_cu (skew_normal_strided).
     """
     if not ctx.apply_fp4 or ctx.mtpr_class != MAX_MTPR_CLASS or not 1024 <= ctx.bucket <= 2048:
         return config
@@ -1190,7 +1198,8 @@ def _tune_muse_spark(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfi
             "sort_block_m": 128, "waves_per_eu_hint": 1, "ascale_packed": True, "epi_fp4_v8": True,
             "pooled_dispatch": True, "ready_xcd": True,
         },
-        stage2={"block_m": 64, "b2stage": True, "deep_a_pipeline": True},
+        stage2={"block_m": 64, "b2stage": True, "deep_a_pipeline": True, "scale_forward": True,
+                "skew_normal_strided": True},
     )
 
 

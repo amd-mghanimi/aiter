@@ -1319,7 +1319,9 @@ class MegaMoEV2:
     def _build_fused_stage2(self):
         from .mega_moe_stage2 import (
             preload_mega_moe_stage2,
+            preload_stage2_scale_forward,
             run_mega_moe_stage2,
+            run_stage2_scale_forward,
             stage2_p2p_row_nbytes,
         )
         from .mega_moe_stage2_aligned_pair import (
@@ -1338,6 +1340,15 @@ class MegaMoEV2:
         self._g2_preload = preload_mega_moe_stage2
         self._g2_pair_run = run_mega_moe_stage2_aligned_pair
         self._g2_pair_preload = preload_mega_moe_stage2_aligned_pair
+        self._g2_scale_fwd_run = run_stage2_scale_forward
+        self._g2_scale_fwd_preload = preload_stage2_scale_forward
+        # Stage2Config.scale_forward: per sorted row and 256-column n-block, its 8 E8M0 scale bytes.
+        self._g2_scale_fwd_rows = int(self._s1_op.srcmap_em.numel())
+        self._g2_scale_stage = None
+        if any(entry.config.stage2.scale_forward for entry in self._bundle_plan.entries):
+            self._g2_scale_stage = torch.empty(
+                (int(comb_cfg.hidden_dim) // 256) * self._g2_scale_fwd_rows * 8, dtype=torch.uint8, device=dev
+            )
         self._g2_residual_stream = torch.cuda.Stream(device=dev, priority=0)
         self._g2_residual_start = torch.cuda.Event()
         self._g2_residual_done = torch.cuda.Event()
@@ -1363,6 +1374,7 @@ class MegaMoEV2:
         op = self._s1_op
         workspace = self._s1_dispatch_workspace
         stage2 = config.stage2
+        scale_forward = self._uses_scale_forward(config, runtime_pair_skip)
         launcher(
             fx.Int64(self._s1_out.view(-1).data_ptr()),
             fx.Int64(self._s1_osd.data_ptr()),
@@ -1400,7 +1412,33 @@ class MegaMoEV2:
             g2_bf16_lds=stage2.bf16_lds,
             runtime_pair_skip=runtime_pair_skip,
             scatter_vec=scatter_vec,
+            scale_fwd_rows=self._g2_scale_fwd_rows if scale_forward else 0,
+            arg_scale_stage=self._g2_scale_stage.data_ptr() if scale_forward else 0,
+            skew_normal_strided=stage2.skew_normal_strided and stage2.skew_cu > 0,
             **self._g2_invariants_by_quant[config.p2p_quant],
+        )
+
+    @staticmethod
+    def _uses_scale_forward(config, runtime_pair_skip):
+        # The aligned-pair residual leaves the pair kernel's rows unstaged, so it stores its scales directly.
+        return config.stage2.scale_forward and not runtime_pair_skip
+
+    def _scale_forward_call(self, launcher, config, stream):
+        """Send the row scales a Stage2Config.scale_forward launch staged."""
+        inv = self._g2_invariants_by_quant[config.p2p_quant]
+        return launcher(
+            self._s1_op.num_valid.data_ptr(),
+            self._s1_op.srcmap_em.data_ptr(),
+            self._s1_op.tile_row_base.data_ptr(),
+            self._g2_scale_stage.data_ptr(),
+            self.comb_op._fx_p2p_comb_inp,
+            stream,
+            model_dim=int(inv["model_dim"]), topk=int(inv["topk"]), npes=int(inv["npes"]),
+            max_tok=int(inv["max_tok"]), recv_cap=int(inv["recv_cap"]),
+            comb_inp_nbytes=int(inv["comb_inp_nbytes"]), p2p_quant_type=config.p2p_quant,
+            BN=config.stage2.block_n, SBM=config.stage1.sort_block_m, scale_fwd_rows=self._g2_scale_fwd_rows,
+            max_rows=-(-int(self._s1_nvm) // config.stage1.sort_block_m)
+            * config.stage1.sort_block_m,
         )
 
     def _preload_fused_stage2(
@@ -1418,6 +1456,8 @@ class MegaMoEV2:
             runtime_pair_skip=runtime_pair_skip,
             scatter_vec=scatter_vec,
         )
+        if self._uses_scale_forward(config, runtime_pair_skip):
+            self._scale_forward_call(self._g2_scale_fwd_preload, config, stream)
 
     def _aligned_pair_stage2_call(self, launcher, config: MegaMoEConfig, stream):
         """Invoke the aligned-pair Stage2 kernel through its shared ABI."""
@@ -1526,6 +1566,8 @@ class MegaMoEV2:
             runtime_pair_skip=bool(runtime_pair_skip),
             scatter_vec=int(scatter_vec),
         )
+        if self._uses_scale_forward(config, runtime_pair_skip):
+            self._scale_forward_call(self._g2_scale_fwd_run, config, s_fx)
         self._g2_active_block_m = stage2.block_m
         if not combine:
             return None
