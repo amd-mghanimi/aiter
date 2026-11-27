@@ -616,8 +616,7 @@ def compile_gemm1(
     use_tile_resource: bool = True, waves_per_eu_hint: int = 2, b_cache_modifier: int = 0,
     a_dtype: str = "fp8", out_dtype: str = "fp8", swiglu_limit: float = 0.0,
     act: str = "silu", situ_beta: float = 1.0, situ_linear_beta: float = 1.0,
-    pair_k: bool = False, lookahead: int = 0, a_ahead: int = 1,
-    ascale_packed: bool = False, fp4_v8: bool = False, epi_lean: int = 0,
+    ascale_packed: bool = False, fp4_v8: bool = False,
 ):
     # fmt: on
     """Compile standalone group GEMM1 from the fused Stage1 compute body."""
@@ -699,8 +698,7 @@ def compile_gemm1(
             a_dtype=a_dtype, out_dtype=out_dtype,
             swiglu_limit=swiglu_limit, evec=8 if use_tile_resource else 2,
             act=act, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta,
-            pair_k=pair_k, lookahead=lookahead, a_ahead=a_ahead,
-            ascale_packed=ascale_packed, fp4_v8=fp4_v8, epi_lean=epi_lean,
+            ascale_packed=ascale_packed, fp4_v8=fp4_v8,
         )
         total_work = (num_valid // fx.Int32(sort_block_m)) * fx.Int32(n_tiles)
         for flat in range(fx.block_idx.x, total_work, grid_x):
@@ -732,8 +730,7 @@ def gemm1_kernel(
     async_a_copy: bool = False, use_tile_resource: bool = True, waves_per_eu_hint: int = 2,
     num_cu: int = 256, b_cache_modifier: int = 0, a_dtype: str = "fp8", out_dtype: str = "fp8",
     swiglu_limit: float = 0.0, act: str = "silu", situ_beta: float = 1.0, situ_linear_beta: float = 1.0,
-    pair_k: bool = False, lookahead: int = 0, a_ahead: int = 1,
-    ascale_packed: bool = False, fp4_v8: bool = False, epi_lean: int = 0,
+    ascale_packed: bool = False, fp4_v8: bool = False,
 ):
     # fmt: on
     """Run standalone MegaMoEV2 group GEMM1 and return ``(out, out_scale)``."""
@@ -753,8 +750,7 @@ def gemm1_kernel(
         waves_per_eu_hint=waves_per_eu_hint, b_cache_modifier=b_cache_modifier,
         a_dtype=a_dtype, out_dtype=out_dtype,
         swiglu_limit=swiglu_limit, act=act, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta,
-        pair_k=pair_k, lookahead=lookahead, a_ahead=a_ahead,
-        ascale_packed=ascale_packed, fp4_v8=fp4_v8, epi_lean=epi_lean,
+        ascale_packed=ascale_packed, fp4_v8=fp4_v8,
     )
     _run_compiled(
         launch, out, x, w.view(torch.uint8), scale_x, scale_w.view(torch.uint8),

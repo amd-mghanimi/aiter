@@ -878,13 +878,13 @@ class SiluQuantEpilogue:
         # so Stage1's evec=8 never routes FP4 to the FP8 store path (which would
         # write FP8 words into the Int8 FP4 buffer).
         self._evec = 2 if self._is_fp4 else evec
-        # fp4_v8: FP4 store pass with 8 columns per lane (_store_quant_fp4_v8); lean bit 1 picks the fast SiLU.
+        # fp4_v8: FP4 store pass with 8 columns per lane (_store_quant_fp4_v8).
         self._fp4_v8 = bool(fp4_v8)
         assert not fp4_v8 or (self._is_fp4 and out_tensor is not None and always_valid)
         # fused_v8: the fused kernels' evec 8 store pass (_store_quant_vec8_fused: valid rows, a store cache policy,
         # tile_rows); lean (fused_v8 only): bit 0 = that pass without serial waits, bit 1 = fast SiLU.
         assert not (fused_v8 and self._evec == 8) or out_tensor is not None
-        assert not lean or (fused_v8 and self._evec == 8) or fp4_v8
+        assert not lean or (fused_v8 and self._evec == 8)
         self._fused_v8 = fused_v8
         self._lean = bool(lean & 1)
         self._fast_silu = bool(lean & 2)
