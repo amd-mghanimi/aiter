@@ -116,7 +116,11 @@ def test_codec_scale_over_every_bf16_magnitude():
     bf16_bits = torch.arange(0, 0x7F80, dtype=torch.int64) << 16
     amaxes = [_f32(bf16_bits)]
     for k in range(-126, 122):
-        center = torch.tensor([127.0 * 2.0**k], dtype=torch.float32).view(torch.int32).to(torch.int64)
+        center = (
+            torch.tensor([127.0 * 2.0**k], dtype=torch.float32)
+            .view(torch.int32)
+            .to(torch.int64)
+        )
         amaxes.append(_f32(center + torch.arange(-64, 65)))
     amax = torch.cat(amaxes)
     amax = amax[amax <= _MAX_FINITE_AMAX]
@@ -141,12 +145,18 @@ def test_codec_edge_values():
     p2p = _check_codec(rows)
     payload, e = p2p[0, :k], p2p[0, k:]
     assert e.tolist() == [0, 124, 147, 130]
-    assert bool((payload[:GROUP] == 128).all()) and bool((decode_rows(p2p, k)[0, :GROUP] == 0).all())
+    assert bool((payload[:GROUP] == 128).all()) and bool(
+        (decode_rows(p2p, k)[0, :GROUP] == 0).all()
+    )
     assert payload[GROUP].item() == 255 and payload[GROUP + 1].item() == 128 - 8
     assert payload[2 * GROUP].item() == 255
-    assert payload[3 * GROUP].item() == 128 + 125 and bool((payload[3 * GROUP + 1 :] == 128).all())
+    assert payload[3 * GROUP].item() == 128 + 125 and bool(
+        (payload[3 * GROUP + 1 :] == 128).all()
+    )
     decoded = decode_rows(p2p, k)[0]
-    assert decoded[GROUP].item() == 127.0 * 2.0**-3 and decoded[GROUP + 1].item() == -1.0
+    assert (
+        decoded[GROUP].item() == 127.0 * 2.0**-3 and decoded[GROUP + 1].item() == -1.0
+    )
 
 
 def test_codec_extremes():
@@ -217,7 +227,12 @@ def _selections():
         for a_dtype in ("fp4", "fp8"):
             for mtpr in (2**i for i in range(16)):
                 tokens = sorted(
-                    {t for b in TOKEN_BUCKETS for t in (b - 1, b, b + 1, 3 * b // 4) if 1 <= t <= mtpr}
+                    {
+                        t
+                        for b in TOKEN_BUCKETS
+                        for t in (b - 1, b, b + 1, 3 * b // 4)
+                        if 1 <= t <= mtpr
+                    }
                 )
                 for t in tokens:
                     yield t, mtpr, {
@@ -230,16 +245,30 @@ def _selections():
 
 
 def test_int8_is_explicit_and_the_fp8_config_on_the_plain_stage2():
-    """"auto" never selects INT8 rows; an explicit int8_blockwise_1x32 is the FP8 config with the
+    """ "auto" never selects INT8 rows; an explicit int8_blockwise_1x32 is the FP8 config with the
     aligned-pair Stage2 (FP8 rows only) turned off."""
     assert P2P_QUANT_I8_BLOCKWISE in SUPPORTED_P2P_QUANT_MODES
-    assert BLOCKWISE_P2P_QUANT_MODES == (P2P_QUANT_FP8_BLOCKWISE, P2P_QUANT_I8_BLOCKWISE)
+    assert BLOCKWISE_P2P_QUANT_MODES == (
+        P2P_QUANT_FP8_BLOCKWISE,
+        P2P_QUANT_I8_BLOCKWISE,
+    )
     count = 0
     for tokens, mtpr, kw in _selections():
-        assert select_mega_moe_config(tokens, mtpr, **kw).p2p_quant != P2P_QUANT_I8_BLOCKWISE
-        fp8 = select_mega_moe_config(tokens, mtpr, p2p_quant=P2P_QUANT_FP8_BLOCKWISE, **kw)
-        int8 = select_mega_moe_config(tokens, mtpr, p2p_quant=P2P_QUANT_I8_BLOCKWISE, **kw)
-        assert not int8.stage2.aligned_pair and int8.stage2.pair_cu == 0 and not int8.stage2.bf16_lds
+        assert (
+            select_mega_moe_config(tokens, mtpr, **kw).p2p_quant
+            != P2P_QUANT_I8_BLOCKWISE
+        )
+        fp8 = select_mega_moe_config(
+            tokens, mtpr, p2p_quant=P2P_QUANT_FP8_BLOCKWISE, **kw
+        )
+        int8 = select_mega_moe_config(
+            tokens, mtpr, p2p_quant=P2P_QUANT_I8_BLOCKWISE, **kw
+        )
+        assert (
+            not int8.stage2.aligned_pair
+            and int8.stage2.pair_cu == 0
+            and not int8.stage2.bf16_lds
+        )
         assert int8 == replace(
             fp8,
             p2p_quant=P2P_QUANT_I8_BLOCKWISE,
@@ -252,9 +281,16 @@ def test_int8_is_explicit_and_the_fp8_config_on_the_plain_stage2():
 @pytest.mark.parametrize("mtpr", (1024, 2048, 8192, 32768))
 def test_int8_bundle_plan(mtpr):
     plan = build_mega_moe_bundle_plan(
-        mtpr, a_dtype="fp4", p2p_quant=P2P_QUANT_I8_BLOCKWISE, experts_per_rank=32, model_dim=4096, inter_dim=4096
+        mtpr,
+        a_dtype="fp4",
+        p2p_quant=P2P_QUANT_I8_BLOCKWISE,
+        experts_per_rank=32,
+        model_dim=4096,
+        inter_dim=4096,
     )
-    assert {entry.config.p2p_quant for entry in plan.entries} == {P2P_QUANT_I8_BLOCKWISE}
+    assert {entry.config.p2p_quant for entry in plan.entries} == {
+        P2P_QUANT_I8_BLOCKWISE
+    }
     assert not any(entry.config.stage2.aligned_pair for entry in plan.entries)
 
 

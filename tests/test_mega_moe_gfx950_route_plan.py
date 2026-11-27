@@ -383,7 +383,9 @@ _LATER_STAGE_KNOBS = (
 def _stage_table(stage):
     """astuple(stage), with the _LATER_STAGE_KNOBS appended as (name, value) only when not at their default."""
     return tuple(
-        getattr(stage, f.name) for f in fields(stage) if f.name not in _LATER_STAGE_KNOBS
+        getattr(stage, f.name)
+        for f in fields(stage)
+        if f.name not in _LATER_STAGE_KNOBS
     ) + tuple(
         (f.name, getattr(stage, f.name))
         for f in fields(stage)
@@ -812,7 +814,9 @@ def _muse_tuned(config):
 def test_muse_spark_tune_gate(mtpr, a_dtype):
     """Only FP4 activations at mtpr >= 2048 (the max capacity class) and buckets 1024 / 2048 take the tune."""
     for tokens in range(1, mtpr + 1):
-        config = select_mega_moe_config(tokens, mtpr, a_dtype=a_dtype, **MUSE_SPARK_SHAPE)
+        config = select_mega_moe_config(
+            tokens, mtpr, a_dtype=a_dtype, **MUSE_SPARK_SHAPE
+        )
         in_buckets = nearest_token_bucket(tokens) in (1024, 2048)
         assert in_buckets == (768 <= tokens <= 3071), tokens
         want = a_dtype == "fp4" and mtpr >= 2048 and in_buckets
@@ -839,7 +843,9 @@ _OTHER_LAYOUTS = (
     (8, 32, 4096, 2048),  # Muse's experts per rank and model_dim
     (4, 64, 4096, 4096),  # Muse's expert shape
 )
-_OTHER_STAGED_DIGEST = "f70d94ae2ed25cdc45eacc96a483c784d100652adab523076d6428042bcb8bbc"
+_OTHER_STAGED_DIGEST = (
+    "f70d94ae2ed25cdc45eacc96a483c784d100652adab523076d6428042bcb8bbc"
+)
 
 
 def _set_fields(obj):
@@ -890,9 +896,16 @@ def test_other_networks_staged_configs_unchanged():
 @pytest.mark.parametrize("mtpr", (1024, 2048, 4096, 16384, 32768))
 def test_stage1_gemm1_knobs_only_muse_route_major(mtpr):
     """ascale_packed / epi_fp4_v8: only the Muse Spark tune (FP4, buckets 1024 and 2048) sets them, and only
-    below INDEXED_PAYLOAD_MIN_MTPR, where GEMM1 reads the route-major payload they were validated on."""
+    below INDEXED_PAYLOAD_MIN_MTPR, where GEMM1 reads the route-major payload they were validated on.
+    """
     muse = (8, 32, 4096, 4096)
-    layouts = (muse, (8, 32, 7168, 2048), (8, 48, 7168, 3072), (8, 112, 3584, 3072), (8, 32, 6144, 2048))
+    layouts = (
+        muse,
+        (8, 32, 7168, 2048),
+        (8, 48, 7168, 3072),
+        (8, 112, 3584, 3072),
+        (8, 32, 6144, 2048),
+    )
     for world, epr, model_dim, inter_dim in layouts:
         for a_dtype in ("fp4", "fp8"):
             for tokens in range(1, mtpr + 1):
@@ -905,11 +918,22 @@ def test_stage1_gemm1_knobs_only_muse_route_major(mtpr):
                     inter_dim=inter_dim,
                     world_size=world,
                 ).stage1
-                tuned = (world, epr, model_dim, inter_dim) == muse and stage1.waves_per_eu_hint == 1
+                tuned = (
+                    world,
+                    epr,
+                    model_dim,
+                    inter_dim,
+                ) == muse and stage1.waves_per_eu_hint == 1
                 want = tuned and mtpr < INDEXED_PAYLOAD_MIN_MTPR
-                assert (stage1.ascale_packed, stage1.epi_fp4_v8) == (want, want), (model_dim, a_dtype, tokens)
+                assert (stage1.ascale_packed, stage1.epi_fp4_v8) == (want, want), (
+                    model_dim,
+                    a_dtype,
+                    tokens,
+                )
     muse_shape = {"experts_per_rank": 32, "model_dim": 4096, "inter_dim": 4096}
-    stage1 = select_mega_moe_config(min(2048, mtpr), mtpr, a_dtype="fp4", **muse_shape).stage1
+    stage1 = select_mega_moe_config(
+        min(2048, mtpr), mtpr, a_dtype="fp4", **muse_shape
+    ).stage1
     if mtpr >= 2048:
         # The rest of the tune still applies on the indexed payload.
         assert (stage1.sort_block_m, stage1.waves_per_eu_hint) == (128, 1)
@@ -919,28 +943,42 @@ def test_stage1_gemm1_knobs_only_muse_route_major(mtpr):
 @pytest.mark.parametrize("num_xcds", (None, 1, 2, 4, 6, 8, 16))
 def test_ready_xcd_needs_eight_xcds(num_xcds):
     """ready_xcd hangs Stage1 unless every one of its 8 per-XCD counters has an XCD draining it: the plan
-    for a device with another (or an unknown) XCD count clears it and changes nothing else."""
-    muse = {"a_dtype": "fp4", "experts_per_rank": 32, "model_dim": 4096, "inter_dim": 4096}
+    for a device with another (or an unknown) XCD count clears it and changes nothing else.
+    """
+    muse = {
+        "a_dtype": "fp4",
+        "experts_per_rank": 32,
+        "model_dim": 4096,
+        "inter_dim": 4096,
+    }
     assert READY_XCD_NUM_XCDS == 8
     assert ready_xcd_supported(num_xcds) == (num_xcds == 8)
     plan = build_mega_moe_bundle_plan(2048, num_xcds=num_xcds, **muse)
     default = build_mega_moe_bundle_plan(2048, **muse)
-    ready = {entry.token_bucket for entry in plan.entries if entry.config.stage1.ready_xcd}
-    assert {entry.token_bucket for entry in default.entries if entry.config.stage1.ready_xcd} == {1024, 2048}
+    ready = {
+        entry.token_bucket for entry in plan.entries if entry.config.stage1.ready_xcd
+    }
+    assert {
+        entry.token_bucket for entry in default.entries if entry.config.stage1.ready_xcd
+    } == {1024, 2048}
     assert ready == ({1024, 2048} if num_xcds == 8 else set())
     for entry, default_entry in zip(plan.entries, default.entries, strict=True):
         assert entry.config.stage2 == default_entry.config.stage2
         assert replace(entry.config.stage1, ready_xcd=False) == replace(
             default_entry.config.stage1, ready_xcd=False
         )
-    assert not any(variant.ready_xcd for variant in plan.stage1_variants) or num_xcds == 8
+    assert (
+        not any(variant.ready_xcd for variant in plan.stage1_variants) or num_xcds == 8
+    )
 
 
 def test_megamoe_v2_reads_the_device_xcd_count(monkeypatch):
     """MegaMoEV2 plans with the device's XCD count (chip_info), and with None when the runtime cannot tell."""
     from aiter.ops.flydsl.kernels.mega_moe import mega_moe_v2
 
-    monkeypatch.setattr(mega_moe_v2.torch.cuda, "device", lambda device: contextlib.nullcontext())
+    monkeypatch.setattr(
+        mega_moe_v2.torch.cuda, "device", lambda device: contextlib.nullcontext()
+    )
     seen = []
 
     def num_xcds(default):
@@ -959,14 +997,22 @@ def test_megamoe_v2_reads_the_device_xcd_count(monkeypatch):
     assert mega_moe_v2._device_num_xcds("cuda:0") is None
 
 
-_MUSE_FP4 = {"a_dtype": "fp4", "experts_per_rank": 32, "model_dim": 4096, "inter_dim": 4096}
+_MUSE_FP4 = {
+    "a_dtype": "fp4",
+    "experts_per_rank": 32,
+    "model_dim": 4096,
+    "inter_dim": 4096,
+}
 
 
 @pytest.mark.parametrize("mtpr", (1024, 2048, 4096, 32768))
-@pytest.mark.parametrize("p2p_quant", ("auto", "none", "fp8_blockwise_1x32", "int8_blockwise_1x32"))
+@pytest.mark.parametrize(
+    "p2p_quant", ("auto", "none", "fp8_blockwise_1x32", "int8_blockwise_1x32")
+)
 def test_scale_forward_needs_blockwise_rows(p2p_quant, mtpr):
     """Stage2 scale forwarding sends the E8M0 scale line of blockwise P2P rows (compile_mega_moe_stage2
-    rejects it otherwise): the Muse tune requests it only with FP8 / INT8 rows, never with bf16 rows."""
+    rejects it otherwise): the Muse tune requests it only with FP8 / INT8 rows, never with bf16 rows.
+    """
     if p2p_quant == "none" and mtpr >= 8192:
         # The base bucket-8192 config takes the aligned-pair Stage2, which writes FP8 rows only.
         with pytest.raises(ValueError, match="conflicts with aligned-pair Stage2"):
@@ -981,7 +1027,10 @@ def test_scale_forward_needs_blockwise_rows(p2p_quant, mtpr):
             assert config.stage2.block_m == 64, entry.token_bucket
         want = bool(tuned) and entry.token_bucket in (1024, 2048)
         want = want and config.p2p_quant in BLOCKWISE_P2P_QUANT_MODES
-        assert config.stage2.scale_forward == want, (entry.token_bucket, config.p2p_quant)
+        assert config.stage2.scale_forward == want, (
+            entry.token_bucket,
+            config.p2p_quant,
+        )
     assert tuned == (2 if mtpr >= 2048 else 0)
     if p2p_quant == "none":
         assert {entry.config.p2p_quant for entry in plan.entries} == {"none"}
@@ -1000,4 +1049,6 @@ def test_megamoe_v2_scale_forward_needs_blockwise_rows():
         assert config.stage2.scale_forward
         assert MegaMoEV2._uses_scale_forward(config, runtime_pair_skip=False)
         assert not MegaMoEV2._uses_scale_forward(config, runtime_pair_skip=True)
-        assert not MegaMoEV2._uses_scale_forward(replace(config, p2p_quant="none"), runtime_pair_skip=False)
+        assert not MegaMoEV2._uses_scale_forward(
+            replace(config, p2p_quant="none"), runtime_pair_skip=False
+        )
