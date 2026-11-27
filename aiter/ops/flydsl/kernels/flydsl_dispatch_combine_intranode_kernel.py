@@ -432,6 +432,7 @@ def make_combine_kernel(
     skip_stage1: bool = False,
     fp8_direct_cast: bool = False,
     blockwise_fp8_transport: bool = False,
+    blockwise_i8_transport: bool = False,
     max_recv: int | None = None,
     mask_topk_ids: bool = False,
     post_route_norm: bool = False,
@@ -471,6 +472,17 @@ def make_combine_kernel(
         raise ValueError(
             "blockwise_fp8_transport and fp8_direct_cast are mutually exclusive"
         )
+    if blockwise_i8_transport and (not skip_stage1 or data_type != torch.bfloat16):
+        raise ValueError(
+            "blockwise_i8_transport requires skip_stage1=True and external bf16"
+        )
+    if blockwise_i8_transport and (fp8_direct_cast or blockwise_fp8_transport):
+        raise ValueError(
+            "blockwise_i8_transport excludes fp8_direct_cast and blockwise_fp8_transport"
+        )
+    # Blockwise 1x32 transport (FP8 e4m3 or offset int8): payload row then one
+    # E8M0 per 32 values; Stage 3 dequantizes and writes BF16.
+    _blockwise_mx = blockwise_fp8_transport or blockwise_i8_transport
     if mask_topk_ids and (not skip_stage1 or zero_copy):
         raise ValueError("mask_topk_ids requires skip_stage1=True without zero_copy")
     _xfer_bf16_to_fp8 = fp8_direct_cast
@@ -479,7 +491,7 @@ def make_combine_kernel(
     if max_recv is None:
         max_recv = npes * max_tok_per_rank
     _is_fp4 = _transport_dtype == torch.float4_e2m1fn_x2
-    if blockwise_fp8_transport:
+    if _blockwise_mx:
         n_i32 = hidden_dim // 4
         nbytes = hidden_dim + hidden_dim // 32
     elif _is_fp4:
@@ -493,13 +505,32 @@ def make_combine_kernel(
 
     # Stage 1/3 strides diverge only under ``fp8_direct_cast``: external
     # bf16 reads/writes vs fp8 staging. Other modes keep transport == external.
-    if blockwise_fp8_transport or _xfer_bf16_to_fp8:
+    if _blockwise_mx or _xfer_bf16_to_fp8:
         inp_nbytes = hidden_dim * 2
         out_n_i32 = (hidden_dim * 2) // 4
     else:
         inp_nbytes = nbytes
         out_n_i32 = n_i32
-    if blockwise_fp8_transport:
+    if blockwise_i8_transport:
+
+        def _to_accum(i32_val):
+            # Offset int8 (u8 = q + 128): v_cvt_f32_ubyte{0..3}, then the offset.
+            q = Vec.from_elements(
+                [
+                    ((i32_val >> fx.Int32(8 * b)) & fx.Int32(0xFF)).to(fx.Float32)
+                    for b in range(4)
+                ],
+                fx.Float32,
+            )
+            return q - Vec.filled(4, 128.0, fx.Float32)
+
+        def _from_accum(accum_val):
+            return accum_val.to(fx.BFloat16).bitcast(fx.Int32)
+
+        def _zero_accum():
+            return fx.full(4, 0.0, fx.Float32)
+
+    elif blockwise_fp8_transport:
 
         def _to_accum(i32_val):
             _v2f32_fp8 = T.vec(2, T.f32)
@@ -955,7 +986,7 @@ def make_combine_kernel(
             # The route norms need whole rows; one warp per token reads them
             # once for the norms and once to accumulate.
             warps_per_tok = (warps_per_tok > 1).select(1, warps_per_tok)
-        if const_expr(blockwise_fp8_transport):
+        if const_expr(_blockwise_mx):
             # Align warp partitions to the 32-value blockwise FP8 scale.
             scale_blocks = n_elems // 8
             warps_per_tok = (warps_per_tok > scale_blocks).select(
@@ -967,7 +998,7 @@ def make_combine_kernel(
         s3_total_work = cur_rank_num_token * warps_per_tok
 
         # Transport elements per i32 word: blockwise fp8 packs 4, bf16 packs 2.
-        elems_per_i32 = 4 if blockwise_fp8_transport else 2
+        elems_per_i32 = 4 if _blockwise_mx else 2
         if const_expr(post_route_norm):
             rsrc_gain = create_buffer_resource_from_addr(addr_norm_gain)
             rsrc_route_wts = create_buffer_resource_from_addr(addr_route_wts)
@@ -1004,7 +1035,7 @@ def make_combine_kernel(
                             cache_modifier=_SLC_CACHE,
                         )
                     )
-                    if const_expr(blockwise_fp8_transport):
+                    if const_expr(_blockwise_mx):
                         v = v * _block_scale(
                             expert_scale_rsrcs[k_slot], ec, expert_vlds[k_slot]
                         )
@@ -1055,7 +1086,7 @@ def make_combine_kernel(
                     expert_rsrcs.append(
                         create_buffer_resource_from_addr(expert_tok_addr)
                     )
-                    if const_expr(blockwise_fp8_transport):
+                    if const_expr(_blockwise_mx):
                         expert_scale_rsrcs.append(
                             create_buffer_resource_from_addr(
                                 expert_tok_addr + fx.Int64(hidden_dim)
@@ -1133,7 +1164,7 @@ def make_combine_kernel(
                         if u > 0:
                             kw["soffset_bytes"] = u * 256
                         vals[u].append(_maybe_load(rsrc_k, ec_abs, vld_k, **kw))
-                        if const_expr(blockwise_fp8_transport):
+                        if const_expr(_blockwise_mx):
                             scale_idx = (ec_abs + u * 64) // 8
                             sc_i32 = fx.Int32(0)
                             if (lane & 7) == 0:
@@ -1150,7 +1181,7 @@ def make_combine_kernel(
                                 )
                             scale_raws[u].append(sc_i32)
 
-                if const_expr(blockwise_fp8_transport):
+                if const_expr(_blockwise_mx):
                     # Broadcast after issuing all VMEM loads to avoid serial vmcnt waits.
                     for u in range_constexpr(U):
                         for k_slot in range_constexpr(experts_per_token):
@@ -1163,7 +1194,7 @@ def make_combine_kernel(
                             )
                             scales[u].append((sc_i32 << 23).bitcast(fx.Float32))
 
-                if const_expr(_xfer_bf16_to_fp8 or blockwise_fp8_transport):
+                if const_expr(_xfer_bf16_to_fp8 or _blockwise_mx):
                     out_off = tok_id * out_n_i32 + ec_abs * 2
                     out_step = 512  # bf16 store on fp8-stride buffer: 2x
                 else:
@@ -1175,11 +1206,11 @@ def make_combine_kernel(
                         fp32_acc = _zero_accum()
                         for k_slot in range_constexpr(experts_per_token):
                             v = _to_accum(vals[u][k_slot])
-                            if const_expr(blockwise_fp8_transport):
+                            if const_expr(_blockwise_mx):
                                 v = v * scales[u][k_slot]
                             fp32_acc = fp32_acc + v * coefs[k_slot]
                         acc = _from_accum(fp32_acc * _gain(ec_abs + u * 64))
-                    elif const_expr(blockwise_fp8_transport):
+                    elif const_expr(_blockwise_mx):
                         fp32_acc = _zero_accum()
                         for k_slot in range_constexpr(experts_per_token):
                             fp32_acc = (
@@ -1390,6 +1421,7 @@ def make_combine_jit(
     skip_stage1=False,
     fp8_direct_cast: bool = False,
     blockwise_fp8_transport: bool = False,
+    blockwise_i8_transport: bool = False,
     max_recv=None,
     mask_topk_ids: bool = False,
     post_route_norm: bool = False,
@@ -1417,6 +1449,7 @@ def make_combine_jit(
         skip_stage1=skip_stage1,
         fp8_direct_cast=fp8_direct_cast,
         blockwise_fp8_transport=blockwise_fp8_transport,
+        blockwise_i8_transport=blockwise_i8_transport,
         max_recv=max_recv,
         mask_topk_ids=mask_topk_ids,
         post_route_norm=post_route_norm,

@@ -108,13 +108,15 @@ def _pack_offset_u8(vals, e8m0):
     return fx.Vector.from_elements(words, fx.Int32)
 
 
-def _fp8_quant_1x32(vals, lane, group_lane=None, leader_gate=None):
+def _fp8_quant_1x32(vals, lane, group_lane=None, leader_gate=None, route_i8=False):
     """Quantize this lane's ``vals`` to FP8 with one E8M0 scale per 32-wide lane group.
 
     The ``32 // len(vals)`` adjacent lanes of a group share the |max|; the group's
     leader (``group_lane``, default ``lane``, a multiple of the group size, and
     ``leader_gate`` if given) derives the scale and broadcasts it.  Returns the E8M0
-    scale, the packed FP8 words and the leader predicate.
+    scale, the packed FP8 words and the leader predicate.  ``route_i8``: offset int8
+    words (u8 = q + 128, |q| <= 127) as _fp8_quant_1x32_lean packs them; every lane
+    derives the scale from the shared |max| itself.
     """
     scatter_vec = len(vals)
     local_max = fabs_f32(vals[0])
@@ -129,6 +131,9 @@ def _fp8_quant_1x32(vals, lane, group_lane=None, leader_gate=None):
     is_leader = (group_lane & fx.Int32(scale_group_lanes - 1)) == fx.Int32(0)
     if leader_gate is not None:
         is_leader = leader_gate & is_leader
+    if const_expr(route_i8):
+        e8m0 = _fp8_scale_e8m0(local_max, 0x3C010204)
+        return e8m0, _pack_offset_u8(vals, e8m0), is_leader
     leader_e8m0 = _fp8_scale_for_leader(is_leader, local_max)
     e8m0 = fx.Int32(fx.shuffle_idx(leader_e8m0, leader_lane, 64))
     packed_words = _pack_fp8_e4m3(vals, e8m0)
@@ -312,9 +317,13 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
     )
 
     dynamic = p2p_quant_type == "dynamic"
-    quant_fp8 = p2p_quant_type == "fp8_blockwise_1x32"
-    if p2p_quant_type not in ("none", "fp8_blockwise_1x32", "dynamic"):
+    # int8_blockwise_1x32 shares the FP8 row layout (payload bytes, then one E8M0 per 32); its bytes are
+    # offset int8 as route_i8 packs them.
+    quant_i8 = p2p_quant_type == "int8_blockwise_1x32"
+    quant_fp8 = p2p_quant_type == "fp8_blockwise_1x32" or quant_i8
+    if p2p_quant_type not in ("none", "fp8_blockwise_1x32", "int8_blockwise_1x32", "dynamic"):
         raise ValueError(f"unsupported p2p_quant_type={p2p_quant_type!r}")
+    assert not (quant_i8 and (epi_lean or scale_stage is not None))
     assert not (dynamic and g2_bf16_lds)
     if fp8_store_cm is None:
         fp8_store_cm = store_cm
@@ -460,7 +469,7 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
                 e8m0, payload = _fp8_quant_1x32_lean(vals, route_i8)
                 scale_leader = active & ((lane & fx.Int32(3)) == fx.Int32(0))
             else:
-                e8m0, payload, is_scale_leader = _fp8_quant_1x32(vals, lane)
+                e8m0, payload, is_scale_leader = _fp8_quant_1x32(vals, lane, route_i8=quant_i8)
                 scale_leader = active & is_scale_leader
             payload_off = (valid & active).select(
                 row_off + col,
@@ -550,7 +559,11 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
         count_rows()
 
 
-_P2P_ROW_NBYTES = {"none": lambda n: n * 2, "fp8_blockwise_1x32": lambda n: n + n // 32}
+_P2P_ROW_NBYTES = {
+    "none": lambda n: n * 2,
+    "fp8_blockwise_1x32": lambda n: n + n // 32,
+    "int8_blockwise_1x32": lambda n: n + n // 32,
+}
 
 
 def stage2_p2p_row_nbytes(model_dim, p2p_quant_type):
@@ -593,10 +606,10 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     SBM = BM if SBM is None else int(SBM)
     if SBM % BM != 0:
         raise AssertionError(f"SBM ({SBM}) must be a multiple of BM ({BM})")
-    if p2p_quant_type not in ("none", "fp8_blockwise_1x32"):
+    if p2p_quant_type not in _P2P_ROW_NBYTES:
         raise ValueError(f"unsupported p2p_quant_type={p2p_quant_type!r}")
-    if p2p_quant_type == "fp8_blockwise_1x32" and g2_bf16_lds:
-        raise ValueError("fp8_blockwise_1x32 requires f32 CShuffle input (g2_bf16_lds=False)")
+    if p2p_quant_type != "none" and g2_bf16_lds:
+        raise ValueError(f"{p2p_quant_type} requires f32 CShuffle input (g2_bf16_lds=False)")
     if scatter_vec not in (8, 16):
         raise ValueError("Stage2 scatter_vec must be 8 or 16")
     if BN % scatter_vec or 32 % scatter_vec:
@@ -627,7 +640,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     if lds_bytes > 160 * 1024:
         raise ValueError(f"Stage2 LDS use {lds_bytes} exceeds 160 KiB")
     _recv_cap = npes * max_tok if recv_cap is None else int(recv_cap)
-    _row_nbytes = N_OUT + N_OUT // 32 if p2p_quant_type == "fp8_blockwise_1x32" else N_OUT * 2
+    _row_nbytes = stage2_p2p_row_nbytes(N_OUT, p2p_quant_type)
     _comb_inp_nbytes = max_tok * topk * _row_nbytes if comb_inp_nbytes is None else int(comb_inp_nbytes)
     if not 0 < _comb_inp_nbytes < _BUFFER_OFFSET_ABI_BYTES:
         raise ValueError("MegaMoE v2 stage2 P2P buffer exceeds the 32-bit buffer-resource ABI")

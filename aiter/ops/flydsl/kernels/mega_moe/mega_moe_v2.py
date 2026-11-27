@@ -24,6 +24,7 @@ from .dispatch import DISPATCH_TABLE_SIZE, DispatchSlot
 from .mega_moe_config import (
     DEFAULT_SMALL_M_MTPRS,
     INDEXED_PAYLOAD_MIN_MTPR,
+    P2P_QUANT_I8_BLOCKWISE,
     ROUTE_LARGE_M,
     ROUTE_SMALL_M,
     ROUTE_STAGED,
@@ -126,6 +127,10 @@ class MegaMoEV2:
             self._unit_wts = torch.ones(
                 self.mtpr, self.topk, dtype=torch.float32, device=self.dev
             )
+        if stage2_p2p_quant == P2P_QUANT_I8_BLOCKWISE:
+            if small_m_mtprs or large_m_enabled:
+                raise ValueError(f"{stage2_p2p_quant} supports the staged route only")
+            small_m_mtprs, large_m_enabled = (), False
         if small_m_mtprs is None:
             small_m_mtprs = DEFAULT_SMALL_M_MTPRS if routed else ()
         if large_m_enabled is None:
@@ -1337,7 +1342,7 @@ class MegaMoEV2:
         self._g2_residual_start = torch.cuda.Event()
         self._g2_residual_done = torch.cuda.Event()
         self._g2_invariants_by_quant = {}
-        for p2p_quant in ("none", "fp8_blockwise_1x32"):
+        for p2p_quant in ("none", "fp8_blockwise_1x32", P2P_QUANT_I8_BLOCKWISE):
             p2p_row_nbytes = stage2_p2p_row_nbytes(comb_cfg.hidden_dim, p2p_quant)
             self._g2_invariants_by_quant[p2p_quant] = {
                 "model_dim": int(comb_cfg.hidden_dim), "inter_dim": int(self.inter_dim),

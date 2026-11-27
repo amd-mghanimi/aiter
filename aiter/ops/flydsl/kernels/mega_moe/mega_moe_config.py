@@ -122,7 +122,16 @@ FUSED_TOKEN_BUCKETS = tuple(b for b in TOKEN_BUCKETS if b != 2)
 LARGE_M_MIN_TOKENS = SMALL_M_MAX_MTPR + 1
 P2P_QUANT_NONE = "none"
 P2P_QUANT_FP8_BLOCKWISE = "fp8_blockwise_1x32"
-SUPPORTED_P2P_QUANT_MODES = (P2P_QUANT_NONE, P2P_QUANT_FP8_BLOCKWISE)
+# INT8 combine rows: the FP8 row layout and bytes (one E8M0 scale per 32 values), with offset int8
+# (u8 = q + 128, |q| <= 127) payload bytes. About 3.4x lower route error than E4M3. Selected
+# explicitly; "auto" never picks it, and the fused small- and large-input routes do not take it.
+P2P_QUANT_I8_BLOCKWISE = "int8_blockwise_1x32"
+SUPPORTED_P2P_QUANT_MODES = (
+    P2P_QUANT_NONE,
+    P2P_QUANT_FP8_BLOCKWISE,
+    P2P_QUANT_I8_BLOCKWISE,
+)
+BLOCKWISE_P2P_QUANT_MODES = (P2P_QUANT_FP8_BLOCKWISE, P2P_QUANT_I8_BLOCKWISE)
 
 ACTIVATION_FP4 = "fp4"
 ACTIVATION_FP8 = "fp8"
@@ -382,10 +391,10 @@ class MegaMoEConfig:
             raise ValueError(
                 f"Stage2 block_m={bm} must divide Stage1 sort_block_m={sbm}"
             )
-        if self.p2p_quant not in ("none", "fp8_blockwise_1x32"):
+        if self.p2p_quant not in SUPPORTED_P2P_QUANT_MODES:
             raise ValueError(f"unsupported p2p_quant={self.p2p_quant!r}")
         if self.p2p_quant != "none" and self.stage2.bf16_lds:
-            raise ValueError("FP8 P2P requires Stage2 bf16_lds=False")
+            raise ValueError("FP8/INT8 P2P requires Stage2 bf16_lds=False")
         if self.stage2.deep_a_pipeline and not self.stage2.b2stage:
             raise ValueError("Stage2 deep_a_pipeline requires b2stage=True")
 
@@ -403,7 +412,7 @@ class Stage2BundleKey:
             raise ValueError(
                 f"Stage2 block_m={self.config.block_m} must divide bundle SBM={self.sbm}"
             )
-        if self.p2p_quant not in ("none", "fp8_blockwise_1x32"):
+        if self.p2p_quant not in SUPPORTED_P2P_QUANT_MODES:
             raise ValueError(f"unsupported p2p_quant={self.p2p_quant!r}")
 
 
@@ -942,7 +951,7 @@ def _tune_v4_pro(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
             stage2=bucket_stage2,
         )
 
-    if config.p2p_quant == P2P_QUANT_FP8_BLOCKWISE and bucket == 1024:
+    if config.p2p_quant in BLOCKWISE_P2P_QUANT_MODES and bucket == 1024:
         config = _replace_config(
             config,
             stage1={"grid_mult": 1},
@@ -1375,6 +1384,10 @@ def select_mega_moe_config(
         # is the race-safe path (only the SYNC reg->LDS copy races at SBM32+nw8)
         # and it reclaims the small-bucket cost that forcing sync would add.
         config = _replace_config(config, stage1={"async_a_copy": True})
+    if config.stage2.aligned_pair and config.p2p_quant == P2P_QUANT_I8_BLOCKWISE:
+        # The aligned-pair kernel writes FP8 rows only; an explicitly requested
+        # INT8 combine keeps the plain Stage2.
+        config = _replace_config(config, stage2={"aligned_pair": False, "pair_cu": 0})
     if config.stage2.aligned_pair and config.p2p_quant != P2P_QUANT_FP8_BLOCKWISE:
         # The aligned-pair Stage2 kernel only emits the FP8 P2P row layout, so
         # reject the combination here instead of at launch.
