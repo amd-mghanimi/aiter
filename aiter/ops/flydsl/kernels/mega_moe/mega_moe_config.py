@@ -1446,6 +1446,9 @@ def select_mega_moe_config(
         )
     if config.stage1.ready_xcd and not ready_xcd_supported(num_xcds):
         config = _replace_config(config, stage1={"ready_xcd": False})
+    if config.stage2.scale_forward and config.p2p_quant not in BLOCKWISE_P2P_QUANT_MODES:
+        # Scale forwarding sends the E8M0 scale line of blockwise P2P rows; bf16 rows have none.
+        config = _replace_config(config, stage2={"scale_forward": False})
     return config
 
 

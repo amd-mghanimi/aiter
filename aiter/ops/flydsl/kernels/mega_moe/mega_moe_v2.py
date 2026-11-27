@@ -22,6 +22,7 @@ from ..flydsl_dispatch_combine_intranode_op import (
 from ..tensor_shim import torch_stream
 from .dispatch import DISPATCH_TABLE_SIZE, DispatchSlot
 from .mega_moe_config import (
+    BLOCKWISE_P2P_QUANT_MODES,
     DEFAULT_SMALL_M_MTPRS,
     INDEXED_PAYLOAD_MIN_MTPR,
     P2P_QUANT_I8_BLOCKWISE,
@@ -1431,7 +1432,11 @@ class MegaMoEV2:
     @staticmethod
     def _uses_scale_forward(config, runtime_pair_skip):
         # The aligned-pair residual leaves the pair kernel's rows unstaged, so it stores its scales directly.
-        return config.stage2.scale_forward and not runtime_pair_skip
+        return (
+            config.stage2.scale_forward
+            and config.p2p_quant in BLOCKWISE_P2P_QUANT_MODES
+            and not runtime_pair_skip
+        )
 
     def _scale_forward_call(self, launcher, config, stream):
         """Send the row scales a Stage2Config.scale_forward launch staged."""

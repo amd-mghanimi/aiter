@@ -20,6 +20,7 @@ import hashlib
 from dataclasses import MISSING, fields, replace
 
 from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
+    BLOCKWISE_P2P_QUANT_MODES,
     DEFAULT_SMALL_M_MTPRS,
     FUSED_TOKEN_BUCKETS,
     INDEXED_PAYLOAD_MIN_MTPR,
@@ -956,3 +957,47 @@ def test_megamoe_v2_reads_the_device_xcd_count(monkeypatch):
 
     monkeypatch.setattr(mega_moe_v2, "get_num_xcds", no_attribute)
     assert mega_moe_v2._device_num_xcds("cuda:0") is None
+
+
+_MUSE_FP4 = {"a_dtype": "fp4", "experts_per_rank": 32, "model_dim": 4096, "inter_dim": 4096}
+
+
+@pytest.mark.parametrize("mtpr", (1024, 2048, 4096, 32768))
+@pytest.mark.parametrize("p2p_quant", ("auto", "none", "fp8_blockwise_1x32", "int8_blockwise_1x32"))
+def test_scale_forward_needs_blockwise_rows(p2p_quant, mtpr):
+    """Stage2 scale forwarding sends the E8M0 scale line of blockwise P2P rows (compile_mega_moe_stage2
+    rejects it otherwise): the Muse tune requests it only with FP8 / INT8 rows, never with bf16 rows."""
+    if p2p_quant == "none" and mtpr >= 8192:
+        # The base bucket-8192 config takes the aligned-pair Stage2, which writes FP8 rows only.
+        with pytest.raises(ValueError, match="conflicts with aligned-pair Stage2"):
+            build_mega_moe_bundle_plan(mtpr, p2p_quant=p2p_quant, **_MUSE_FP4)
+        return
+    plan = build_mega_moe_bundle_plan(mtpr, p2p_quant=p2p_quant, **_MUSE_FP4)
+    tuned = 0
+    for entry in plan.entries:
+        config = entry.config
+        if config.stage1.waves_per_eu_hint == 1 and config.stage2.deep_a_pipeline:
+            tuned += 1
+            assert config.stage2.block_m == 64, entry.token_bucket
+        want = bool(tuned) and entry.token_bucket in (1024, 2048)
+        want = want and config.p2p_quant in BLOCKWISE_P2P_QUANT_MODES
+        assert config.stage2.scale_forward == want, (entry.token_bucket, config.p2p_quant)
+    assert tuned == (2 if mtpr >= 2048 else 0)
+    if p2p_quant == "none":
+        assert {entry.config.p2p_quant for entry in plan.entries} == {"none"}
+    # The small-input kernels' "dynamic" rows never come from the staged config.
+    with pytest.raises(ValueError, match="unsupported p2p_quant"):
+        select_mega_moe_config(min(2048, mtpr), mtpr, p2p_quant="dynamic", **_MUSE_FP4)
+
+
+def test_megamoe_v2_scale_forward_needs_blockwise_rows():
+    """MegaMoEV2 launches the forward pass only for blockwise rows, also for a config patched past the
+    selection rules (e.g. a scale_forward override over bf16 rows)."""
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_v2 import MegaMoEV2
+
+    for p2p_quant in BLOCKWISE_P2P_QUANT_MODES:
+        config = select_mega_moe_config(2048, 2048, p2p_quant=p2p_quant, **_MUSE_FP4)
+        assert config.stage2.scale_forward
+        assert MegaMoEV2._uses_scale_forward(config, runtime_pair_skip=False)
+        assert not MegaMoEV2._uses_scale_forward(config, runtime_pair_skip=True)
+        assert not MegaMoEV2._uses_scale_forward(replace(config, p2p_quant="none"), runtime_pair_skip=False)
