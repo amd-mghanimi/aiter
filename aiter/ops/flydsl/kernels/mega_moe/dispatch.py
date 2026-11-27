@@ -463,7 +463,9 @@ def _publish_tile_range(
                     ptr_buf_tensor(remote_queue, fx.Int32)[ready_slot] = tile
                     fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
                     comm_ops.fence_system_release()
-                    comm_ops.store_i32_system(remote_queue_epoch, ready_slot, payload_epoch)
+                    comm_ops.store_i32_system(
+                        remote_queue_epoch, ready_slot, payload_epoch
+                    )
 
 
 # fmt: off
