@@ -535,6 +535,20 @@ def small_m_cu_supported(num_cu: int) -> bool:
     return num_cu == 256
 
 
+# Stage1Config.ready_xcd keeps one arrival-order work counter per XCD (XCC id & 7).
+READY_XCD_NUM_XCDS = 8
+
+
+def ready_xcd_supported(num_xcds: int | None) -> bool:
+    """Whether Stage1Config.ready_xcd may run on a device with ``num_xcds`` XCDs (None: unknown).
+
+    XCD x drains only its own counter, which hands out n-tiles {x, x + 8}. With fewer XCDs (CPX / DPX
+    partitions, smaller parts) some counters are never drained, their tiles never run and Stage2 waits
+    forever, so ready_xcd needs exactly READY_XCD_NUM_XCDS.
+    """
+    return num_xcds == READY_XCD_NUM_XCDS
+
+
 def small_m_mtprs_for(mtpr: int, mtprs=DEFAULT_SMALL_M_MTPRS) -> tuple[int, ...]:
     """Small-input capacities an instance of capacity ``mtpr`` can reach.
 
@@ -1299,7 +1313,9 @@ def select_mega_moe_config(
     model_dim: int = 7168,
     inter_dim: int = 3072,
     world_size: int = 8,
+    num_xcds: int | None = READY_XCD_NUM_XCDS,
 ) -> MegaMoEConfig:
+    """``num_xcds``: the device's XCD count (None: unknown); ready_xcd is cleared unless ready_xcd_supported."""
     if a_dtype not in SUPPORTED_ACTIVATION_DTYPES:
         raise ValueError(f"unsupported activation dtype={a_dtype!r}")
     if p2p_quant not in (P2P_QUANT_AUTO, *SUPPORTED_P2P_QUANT_MODES):
@@ -1428,6 +1444,8 @@ def select_mega_moe_config(
         raise ValueError(
             f"p2p_quant={config.p2p_quant!r} conflicts with aligned-pair Stage2"
         )
+    if config.stage1.ready_xcd and not ready_xcd_supported(num_xcds):
+        config = _replace_config(config, stage1={"ready_xcd": False})
     return config
 
 
@@ -1443,11 +1461,13 @@ def build_mega_moe_bundle_plan(
     world_size: int = 8,
     small_m_mtprs: tuple[int, ...] = (),
     large_m: bool = False,
+    num_xcds: int | None = READY_XCD_NUM_XCDS,
 ) -> MegaMoEBundlePlan:
     """Deduplicate variants while keeping Stage1/Stage2 selection atomic.
 
     ``small_m_mtprs`` / ``large_m`` add the fused routes; the caller has checked
-    the layout supports them (:func:`fused_layout_supported`).
+    the layout supports them (:func:`fused_layout_supported`). ``num_xcds``: the
+    device's XCD count, see :func:`select_mega_moe_config`.
     """
     if mtpr <= 0 or mtpr & (mtpr - 1):
         raise ValueError(f"mtpr={mtpr} must be a positive power of two")
@@ -1479,6 +1499,7 @@ def build_mega_moe_bundle_plan(
             model_dim=model_dim,
             inter_dim=inter_dim,
             world_size=world_size,
+            num_xcds=num_xcds,
         )
         stage1_key = stage1_bundle_identity(config.stage1)
         stage1_id = stage1_ids.setdefault(stage1_key, len(stage1_variants))

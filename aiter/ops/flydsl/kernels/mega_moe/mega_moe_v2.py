@@ -9,7 +9,7 @@ import mori.shmem as ms
 import torch
 
 from aiter import logger
-from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.jit.utils.chip_info import get_gfx_runtime, get_num_xcds
 from aiter.utility import dtypes
 
 from ..flydsl_dispatch_combine_intranode_op import (
@@ -47,6 +47,15 @@ from .weights import (
 )
 
 __all__ = ["MegaMoEV2"]
+
+
+def _device_num_xcds(device) -> int | None:
+    """XCD count of ``device``, or None when the HIP runtime cannot report it."""
+    with torch.cuda.device(device):
+        try:
+            return get_num_xcds(default=None)
+        except (RuntimeError, OSError):
+            return None
 
 
 class MegaMoEV2:
@@ -156,6 +165,7 @@ class MegaMoEV2:
             model_dim=self.model_dim,
             inter_dim=self.inter_dim,
             world_size=self.world_size,
+            num_xcds=_device_num_xcds(self.dev),
             small_m_mtprs=(
                 tuple(small_m_mtprs) if fused and small_m_cu_supported(num_cu) else ()
             ),

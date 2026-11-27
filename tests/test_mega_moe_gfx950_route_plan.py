@@ -15,8 +15,9 @@ import pytest
 pytest.importorskip("flydsl", reason="MegaMoE is built with FlyDSL")
 pytest.importorskip("mori.shmem", reason="MegaMoE's runtime imports mori")
 
+import contextlib
 import hashlib
-from dataclasses import MISSING, fields
+from dataclasses import MISSING, fields, replace
 
 from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     DEFAULT_SMALL_M_MTPRS,
@@ -24,6 +25,7 @@ from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     INDEXED_PAYLOAD_MIN_MTPR,
     LARGE_M_MIN_TOKENS,
     LARGE_M_MTPRS,
+    READY_XCD_NUM_XCDS,
     ROUTE_LARGE_M,
     ROUTE_SMALL_M,
     ROUTE_STAGED,
@@ -34,6 +36,7 @@ from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     fused_layout_supported,
     large_m_mtprs_for,
     nearest_token_bucket,
+    ready_xcd_supported,
     select_fused_config,
     select_mega_moe_config,
     small_m_cu_supported,
@@ -908,3 +911,46 @@ def test_stage1_gemm1_knobs_only_muse_route_major(mtpr):
         # The rest of the tune still applies on the indexed payload.
         assert (stage1.sort_block_m, stage1.waves_per_eu_hint) == (128, 1)
         assert stage1.ascale_packed == (mtpr < INDEXED_PAYLOAD_MIN_MTPR)
+
+
+@pytest.mark.parametrize("num_xcds", (None, 1, 2, 4, 6, 8, 16))
+def test_ready_xcd_needs_eight_xcds(num_xcds):
+    """ready_xcd hangs Stage1 unless every one of its 8 per-XCD counters has an XCD draining it: the plan
+    for a device with another (or an unknown) XCD count clears it and changes nothing else."""
+    muse = {"a_dtype": "fp4", "experts_per_rank": 32, "model_dim": 4096, "inter_dim": 4096}
+    assert READY_XCD_NUM_XCDS == 8
+    assert ready_xcd_supported(num_xcds) == (num_xcds == 8)
+    plan = build_mega_moe_bundle_plan(2048, num_xcds=num_xcds, **muse)
+    default = build_mega_moe_bundle_plan(2048, **muse)
+    ready = {entry.token_bucket for entry in plan.entries if entry.config.stage1.ready_xcd}
+    assert {entry.token_bucket for entry in default.entries if entry.config.stage1.ready_xcd} == {1024, 2048}
+    assert ready == ({1024, 2048} if num_xcds == 8 else set())
+    for entry, default_entry in zip(plan.entries, default.entries, strict=True):
+        assert entry.config.stage2 == default_entry.config.stage2
+        assert replace(entry.config.stage1, ready_xcd=False) == replace(
+            default_entry.config.stage1, ready_xcd=False
+        )
+    assert not any(variant.ready_xcd for variant in plan.stage1_variants) or num_xcds == 8
+
+
+def test_megamoe_v2_reads_the_device_xcd_count(monkeypatch):
+    """MegaMoEV2 plans with the device's XCD count (chip_info), and with None when the runtime cannot tell."""
+    from aiter.ops.flydsl.kernels.mega_moe import mega_moe_v2
+
+    monkeypatch.setattr(mega_moe_v2.torch.cuda, "device", lambda device: contextlib.nullcontext())
+    seen = []
+
+    def num_xcds(default):
+        seen.append(default)
+        return 4
+
+    monkeypatch.setattr(mega_moe_v2, "get_num_xcds", num_xcds)
+    assert mega_moe_v2._device_num_xcds("cuda:0") == 4
+    # A count the plan depends on must not fall back to chip_info's default of 8.
+    assert seen == [None]
+
+    def no_attribute(default):
+        raise RuntimeError("HIP runtime predates hipDeviceAttributeNumberOfXccs")
+
+    monkeypatch.setattr(mega_moe_v2, "get_num_xcds", no_attribute)
+    assert mega_moe_v2._device_num_xcds("cuda:0") is None
