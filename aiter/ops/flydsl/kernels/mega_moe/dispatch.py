@@ -1775,7 +1775,7 @@ def emit_dispatch_payload(
                     scale_table[destination], fx.Int32, unit_elems=4
                 )
 
-        def _row_body(row, wk, token_vals, headers_pre=None, scale_pre=None):
+        def _row_body(row, wk, token_vals, headers_pre=None, scale_pre=None, headers_fit=None):
             source_token = wk // fx.Int32(fz_k)
             topk_slot = wk % fx.Int32(fz_k)
             group_member_slots = (wk >> fx.Int32(24)) & fx.Int32(0xFF)
@@ -1803,42 +1803,51 @@ def emit_dispatch_payload(
                         source_encoding
                     )
 
-            if lane == fx.Int32(0):
-                if const_expr(headers_pre is not None):
-                    for active, route, route_row, weight in headers_pre:
-                        if active:
-                            _copy_route_header(route, route_row, weight)
-                else:
-                    if group_task:
-                        if const_expr(fz_k <= 8):
-                            for slot in range_constexpr(fz_k):
-                                member_active = (
-                                    group_member_slots >> fx.Int32(slot)
-                                ) & fx.Int32(1)
-                                if member_active != fx.Int32(0):
-                                    member_route = (
-                                        source_token * fx.Int32(fz_k)
-                                        + fx.Int32(slot)
-                                    )
-                                    member_ge = idx_buffer[member_route]
-                                    member_base = group_base[member_ge]
-                                    _copy_route_header(
-                                        member_route, member_base + row
-                                    )
-                        else:
-                            slot_a = group_member_slots & fx.Int32(0xF)
-                            slot_b = (group_member_slots >> fx.Int32(4)) & fx.Int32(
-                                0xF
-                            )
-                            for member_slot in (slot_a, slot_b):
+            def _copy_route_headers():
+                if group_task:
+                    if const_expr(fz_k <= 8):
+                        for slot in range_constexpr(fz_k):
+                            member_active = (
+                                group_member_slots >> fx.Int32(slot)
+                            ) & fx.Int32(1)
+                            if member_active != fx.Int32(0):
                                 member_route = (
-                                    source_token * fx.Int32(fz_k) + member_slot
+                                    source_token * fx.Int32(fz_k)
+                                    + fx.Int32(slot)
                                 )
                                 member_ge = idx_buffer[member_route]
                                 member_base = group_base[member_ge]
-                                _copy_route_header(member_route, member_base + row)
+                                _copy_route_header(
+                                    member_route, member_base + row
+                                )
                     else:
-                        _copy_route_header(wk, destination_row)
+                        slot_a = group_member_slots & fx.Int32(0xF)
+                        slot_b = (group_member_slots >> fx.Int32(4)) & fx.Int32(
+                            0xF
+                        )
+                        for member_slot in (slot_a, slot_b):
+                            member_route = (
+                                source_token * fx.Int32(fz_k) + member_slot
+                            )
+                            member_ge = idx_buffer[member_route]
+                            member_base = group_base[member_ge]
+                            _copy_route_header(member_route, member_base + row)
+                else:
+                    _copy_route_header(wk, destination_row)
+
+            if lane == fx.Int32(0):
+                if const_expr(headers_pre is not None):
+                    # A pair row with a third member bit (a token routed to one
+                    # pair expert twice) takes the per-slot loop, which writes
+                    # every member's header as the unbatched path does.
+                    if headers_fit:
+                        for active, route, route_row, weight in headers_pre:
+                            if active:
+                                _copy_route_header(route, route_row, weight)
+                    else:
+                        _copy_route_headers()
+                else:
+                    _copy_route_headers()
 
             payload_row = destination_row
             if const_expr(indexed_payload):
@@ -1944,11 +1953,13 @@ def emit_dispatch_payload(
 
         def _load_row_pre(wk, row):
             # Header (route, header row, weight) of each route a row carries: the row's
-            # own route, or a fanout-pair row's member slots (bits 24..31 of wk, at
-            # most two set), with their expert's group base loaded here too.
+            # own route, or a fanout-pair row's two lowest member slots (bits 24..31 of
+            # wk), with their expert's group base loaded here too.  Distinct top-k
+            # experts set at most two; headers_fit is false when a third is set.
             source_token = group_task.select(wk & fx.Int32(0xFFFFFF), wk // fx.Int32(fz_k))
             member_slots = group_task.select((wk >> fx.Int32(24)) & fx.Int32(0xFF), fx.Int32(0))
             rest = member_slots & (member_slots - fx.Int32(1))
+            headers_fit = (rest & (rest - fx.Int32(1))) == fx.Int32(0)
             headers = []
             for slots, active in (
                 (member_slots, (member_slots != fx.Int32(0)) | (local_segment != fx.Int32(fz_epr))),
@@ -1975,7 +1986,7 @@ def emit_dispatch_payload(
                     fx.Int32,
                     unit_elems=4,
                 )
-            return headers, scale
+            return headers, scale, headers_fit
 
         if const_expr(batch_rows > 0):
             # batch_rows rows per step, every load (route id, token, weight,
@@ -1995,7 +2006,7 @@ def emit_dispatch_payload(
                 pres = [_load_row_pre(wk, row_j) for wk, row_j in zip(wks, step_rows)]
                 for j in range_constexpr(batch_rows):
                     if step_rows[j] < row_end:
-                        _row_body(step_rows[j], wks[j], vals[j], pres[j][0], pres[j][1])
+                        _row_body(step_rows[j], wks[j], vals[j], pres[j][0], pres[j][1], pres[j][2])
         else:
             # Two rows per step: both route ids are read back to back and both
             # rows' loads are in flight before either is stored, instead of one
