@@ -93,6 +93,14 @@ NETWORKS = {
         "topk": 8,
         "swiglu_limit": 0.0,
     },
+    # Muse Spark A4W4 prefill geometry (EP8: 32 experts a rank, the _tune_muse_spark layout).
+    "muse_spark": {
+        "model_dim": 4096,
+        "inter_dim": 4096,
+        "experts": 256,
+        "topk": 8,
+        "swiglu_limit": 0.0,
+    },
     # Kimi-K3 routing/weight geometry.  This exercises topk16 and EP8/epr112 and
     # the real K3 activation: SiTUv2 (hidden_act="situ"), which self-saturates
     # via tanh, so it carries no hard swiglu clamp.  beta=4.0 / linear_beta=25.0
@@ -1799,7 +1807,7 @@ def main():
     size = parser.add_argument_group("size suite")
     size.add_argument(
         "--stage2-p2p-quant",
-        choices=("auto", "none", "fp8_blockwise_1x32"),
+        choices=("auto", "none", "fp8_blockwise_1x32", "int8_blockwise_1x32"),
         default="auto",
     )
     size.add_argument("--bs-list", default="128")
