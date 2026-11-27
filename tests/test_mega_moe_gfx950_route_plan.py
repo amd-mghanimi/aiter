@@ -16,7 +16,7 @@ pytest.importorskip("flydsl", reason="MegaMoE is built with FlyDSL")
 pytest.importorskip("mori.shmem", reason="MegaMoE's runtime imports mori")
 
 import hashlib
-from dataclasses import astuple, fields
+from dataclasses import MISSING, astuple, fields
 
 from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     DEFAULT_SMALL_M_MTPRS,
@@ -32,7 +32,9 @@ from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     build_mega_moe_bundle_plan,
     fused_layout_supported,
     large_m_mtprs_for,
+    nearest_token_bucket,
     select_fused_config,
+    select_mega_moe_config,
     small_m_cu_supported,
     small_m_mtprs_for,
 )
@@ -763,3 +765,96 @@ def test_ep2_fused_configs_unchanged():
         )
     digest = hashlib.sha256(repr(sorted(table.items())).encode()).hexdigest()
     assert digest == _EP2_FUSED_DIGEST, table
+
+
+# Muse Spark (EP8: 256 experts, top-8, 4096 x 4096 experts), the shape _tune_muse_spark tunes.
+MUSE_SPARK_SHAPE = {"experts_per_rank": 32, "model_dim": 4096, "inter_dim": 4096}
+
+
+def _muse_tuned(config):
+    """The tune's signature: no base config pairs one wave per EU with the deep Stage2 at these buckets."""
+    return (
+        config.stage1.waves_per_eu_hint == 1
+        and config.stage2.b2stage
+        and config.stage2.deep_a_pipeline
+    )
+
+
+@pytest.mark.parametrize("mtpr", (1024, 2048, 4096, 32768))
+@pytest.mark.parametrize("a_dtype", ("fp4", "fp8"))
+def test_muse_spark_tune_gate(mtpr, a_dtype):
+    """Only FP4 activations at mtpr >= 2048 (the max capacity class) and buckets 1024 / 2048 take the tune."""
+    for tokens in range(1, mtpr + 1):
+        config = select_mega_moe_config(tokens, mtpr, a_dtype=a_dtype, **MUSE_SPARK_SHAPE)
+        in_buckets = nearest_token_bucket(tokens) in (1024, 2048)
+        assert in_buckets == (768 <= tokens <= 3071), tokens
+        want = a_dtype == "fp4" and mtpr >= 2048 and in_buckets
+        assert _muse_tuned(config) == want, tokens
+        if want:
+            assert config.stage1.sort_block_m == 128, tokens
+            assert config.stage2.block_m == 64, tokens
+
+
+# Every other layout's staged selection (the registered networks, their EPLB profiles, and shapes sharing part
+# of Muse's identity), as on main (aa62b8657) before the Muse profile. A config enters by its non-default fields,
+# so knobs added later with a default value leave the digest alone. On a mismatch the assertion shows the table.
+_OTHER_LAYOUTS = (
+    # (world_size, experts_per_rank, model_dim, inter_dim)
+    (8, 32, 7168, 2048),  # R1
+    (8, 48, 7168, 3072),  # V4-Pro
+    (8, 52, 7168, 3072),  # V4-Pro EPLB
+    (8, 56, 7168, 3072),  # V4-Pro EPLB
+    (8, 112, 3584, 3072),  # Kimi-K3
+    (2, 192, 5120, 2304),  # V4.1-Flash EP2
+    (4, 96, 5120, 2304),  # V4.1-Flash EP4
+    (8, 48, 5120, 2304),  # V4.1-Flash EP8
+    (8, 32, 6144, 2048),  # GLM-5.2: Muse's experts per rank
+    (8, 32, 4096, 2048),  # Muse's experts per rank and model_dim
+    (4, 64, 4096, 4096),  # Muse's expert shape
+)
+_OTHER_STAGED_DIGEST = "f70d94ae2ed25cdc45eacc96a483c784d100652adab523076d6428042bcb8bbc"
+
+
+def _set_fields(obj):
+    return tuple(
+        (f.name, getattr(obj, f.name))
+        for f in fields(obj)
+        if f.default is MISSING or getattr(obj, f.name) != f.default
+    )
+
+
+def test_other_networks_staged_configs_unchanged():
+    table = {}
+    for world, epr, model_dim, inter_dim in _OTHER_LAYOUTS:
+        for a_dtype in ("fp4", "fp8"):
+            for mtpr in (1 << i for i in range(16)):
+                tokens = {
+                    t
+                    for b in TOKEN_BUCKETS
+                    for t in (b - 1, b, b + 1, 3 * b // 4, 3 * b // 2 - 1, 3 * b // 2)
+                    if 1 <= t <= mtpr
+                }
+                for t in sorted(tokens):
+                    key = (world, epr, model_dim, inter_dim, a_dtype, mtpr, t)
+                    try:
+                        config = select_mega_moe_config(
+                            t,
+                            mtpr,
+                            a_dtype=a_dtype,
+                            experts_per_rank=epr,
+                            model_dim=model_dim,
+                            inter_dim=inter_dim,
+                            world_size=world,
+                        )
+                    except ValueError as exc:
+                        table[key] = type(exc).__name__
+                        continue
+                    table[key] = (
+                        _set_fields(config.stage1),
+                        _set_fields(config.stage2),
+                        config.p2p_quant,
+                        _set_fields(config.fused_stage1),
+                        _set_fields(config.fused_stage2),
+                    )
+    digest = hashlib.sha256(repr(sorted(table.items())).encode()).hexdigest()
+    assert digest == _OTHER_STAGED_DIGEST, table
