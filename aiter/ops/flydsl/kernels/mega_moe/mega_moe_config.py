@@ -171,6 +171,10 @@ class Stage1Config:
     work_shards: int = 8
     payload_chunk_rows: int = 0
     prepare_quant_cu: int = 64
+    # GEMM1 A scales staged to LDS in K-loop order, one ds_read_b32 per row group and K-step (AScaleLoader packed).
+    ascale_packed: bool = False
+    # FP4 GEMM1 epilogue with 8 columns per lane (SiluQuantEpilogue fp4_v8); needs use_tile_resource.
+    epi_fp4_v8: bool = False
 
 
 def stage1_bundle_identity(config: Stage1Config) -> Stage1Config:
@@ -1161,12 +1165,14 @@ def _tune_muse_spark(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfi
     busiest rank ~1.6x the mean), so the 128-row m-tile, which streams a hot expert's
     W1 half as often, and the deep Stage2 pipeline pay off from 1024 tokens a rank.
     At 512 the base SBM64 geometry stays ahead under uniform routes.
+    The packed A scales drop the K-loop's serial per-byte LDS scale reads and the
+    8-column FP4 epilogue the per-pair DS swizzles and byte stores.
     """
     if not ctx.apply_fp4 or ctx.mtpr_class != MAX_MTPR_CLASS or not 1024 <= ctx.bucket <= 2048:
         return config
     return _replace_config(
         config,
-        stage1={"sort_block_m": 128, "waves_per_eu_hint": 1},
+        stage1={"sort_block_m": 128, "waves_per_eu_hint": 1, "ascale_packed": True, "epi_fp4_v8": True},
         stage2={"block_m": 64, "b2stage": True, "deep_a_pipeline": True},
     )
 

@@ -126,6 +126,7 @@ def compile_mega_moe_stage1(
     tile_state_stride: int = 0, a_dtype: str = "fp8", out_dtype: str = "fp8",
     swiglu_limit: float = 0.0,
     act: str = "silu", situ_beta: float = 1.0, situ_linear_beta: float = 1.0,
+    ascale_packed: bool = False, epi_fp4_v8: bool = False,
     _return_kernel_spec: bool = False,
 ):
     arch = str(get_rocm_arch() or "")
@@ -259,6 +260,7 @@ def compile_mega_moe_stage1(
     # Paired GEMM1 K loop for fixed-slot tiles with LDS-DMA A copies; compact
     # prefill is slower with it (its 8-wave tiles already hide the latency).
     PAIR_K = fixed_slot_dispatch and async_a_copy
+    EPI_FP4_V8 = bool(epi_fp4_v8) and out_dtype == "fp4" and use_tile_resource
     # GEMM1 quant epilogue columns per lane (SiluQuantEpilogue; FP4 output uses 2).
     EPI_EVEC = 8
     dispatch_path = "fixedslot" if fixed_slot_dispatch else "compact"
@@ -292,6 +294,8 @@ def compile_mega_moe_stage1(
         f"{'_fc' if compact_dispatch else ''}"
         f"{'_kp2' if PAIR_K else ''}"
         f"{'_ac32' if NARROW_FINAL_A else ''}"
+        f"{'_ap' if ascale_packed else ''}"
+        f"{'_e4v8' if EPI_FP4_V8 else ''}"
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[TOTAL_THREADS, 1, 1])
@@ -549,6 +553,7 @@ def compile_mega_moe_stage1(
             narrow_final_a=NARROW_FINAL_A,
             swiglu_limit=swiglu_limit,
             act=act, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta,
+            ascale_packed=ascale_packed, fp4_v8=EPI_FP4_V8,
         )
 
         if tid == fx.Int32(0):
@@ -794,6 +799,8 @@ def compile_mega_moe_stage1_bundle(
             situ_linear_beta=situ_linear_beta,
             a_dtype=a_dtype,
             out_dtype=out_dtype,
+            ascale_packed=config.ascale_packed,
+            epi_fp4_v8=config.epi_fp4_v8,
             _return_kernel_spec=True,
         )
         for config in variants
