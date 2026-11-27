@@ -16,7 +16,7 @@ pytest.importorskip("flydsl", reason="MegaMoE is built with FlyDSL")
 pytest.importorskip("mori.shmem", reason="MegaMoE's runtime imports mori")
 
 import hashlib
-from dataclasses import MISSING, astuple, fields
+from dataclasses import MISSING, fields
 
 from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     DEFAULT_SMALL_M_MTPRS,
@@ -362,6 +362,23 @@ _FUSED_CASES = (
     (16384, 16384),
 )
 _FUSED_DIGEST = "f8cb680aa7ec3e668f98ed9a71a485c0bdbe703735cbf6477622cb4ae36b0666"
+# Stage1Config / Stage2Config fields added after the digests were pinned: they enter the tables only when set,
+# so a pinned digest changes only where a config sets one.
+_LATER_STAGE_KNOBS = (
+    "ascale_packed",
+    "epi_fp4_v8",
+)
+
+
+def _stage_table(stage):
+    """astuple(stage), with the _LATER_STAGE_KNOBS appended as (name, value) only when not at their default."""
+    return tuple(
+        getattr(stage, f.name) for f in fields(stage) if f.name not in _LATER_STAGE_KNOBS
+    ) + tuple(
+        (f.name, getattr(stage, f.name))
+        for f in fields(stage)
+        if f.name in _LATER_STAGE_KNOBS and getattr(stage, f.name) != f.default
+    )
 
 
 def test_fused_configs_unchanged():
@@ -369,8 +386,8 @@ def test_fused_configs_unchanged():
     for mtpr, tokens in _FUSED_CASES:
         config = select_fused_config(tokens, mtpr)
         table[(mtpr, tokens)] = (
-            astuple(config.stage1),
-            astuple(config.stage2),
+            _stage_table(config.stage1),
+            _stage_table(config.stage2),
             config.p2p_quant,
         )
     digest = hashlib.sha256(repr(sorted(table.items())).encode()).hexdigest()
@@ -420,8 +437,8 @@ _EP2_KNOBS = ("stream_w",)
 
 def _knob_table(config):
     return (
-        astuple(config.stage1),
-        astuple(config.stage2),
+        _stage_table(config.stage1),
+        _stage_table(config.stage2),
         config.p2p_quant,
         tuple(
             (f.name, getattr(config.fused_stage1, f.name))
