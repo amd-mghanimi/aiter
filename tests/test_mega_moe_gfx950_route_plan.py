@@ -943,6 +943,95 @@ def test_stage1_gemm1_knobs_only_muse_route_major(mtpr):
         assert stage1.ascale_packed == (mtpr < INDEXED_PAYLOAD_MIN_MTPR)
 
 
+# Stage1 hot-rank tile knobs, as _tune_muse_spark sets them, and their defaults.
+_HOT_TILE_KNOBS = {"payload_batch_rows": 4, "acquire_once": True, "ready_runs": True}
+_HOT_TILE_DEFAULTS = {
+    "payload_batch_rows": 0,
+    "acquire_once": False,
+    "ready_runs": False,
+}
+
+
+def _hot_tile_knobs(stage1):
+    return {name: getattr(stage1, name) for name in _HOT_TILE_KNOBS}
+
+
+@pytest.mark.parametrize("mtpr", (1024, 2048, 4096, 16384, 32768))
+def test_stage1_hot_tile_knobs_only_muse_tune(mtpr):
+    """payload_batch_rows / acquire_once / ready_runs: only the Muse Spark tune (FP4, mtpr >= 2048, buckets
+    1024 and 2048) sets them, on the route-major and the indexed payload alike; every other selection keeps
+    the defaults, which leave the kernels as before.
+    """
+    muse = (8, 32, 4096, 4096)
+    layouts = (
+        muse,
+        (8, 32, 7168, 2048),
+        (8, 48, 7168, 3072),
+        (8, 112, 3584, 3072),
+        (8, 32, 6144, 2048),
+        (8, 32, 4096, 2048),
+        (4, 64, 4096, 4096),
+    )
+    for world, epr, model_dim, inter_dim in layouts:
+        for a_dtype in ("fp4", "fp8"):
+            for tokens in range(1, mtpr + 1):
+                config = select_mega_moe_config(
+                    tokens,
+                    mtpr,
+                    a_dtype=a_dtype,
+                    experts_per_rank=epr,
+                    model_dim=model_dim,
+                    inter_dim=inter_dim,
+                    world_size=world,
+                )
+                want = (
+                    (world, epr, model_dim, inter_dim) == muse
+                    and a_dtype == "fp4"
+                    and mtpr >= 2048
+                    and nearest_token_bucket(tokens) in (1024, 2048)
+                )
+                assert want == (
+                    (world, epr, model_dim, inter_dim) == muse and _muse_tuned(config)
+                )
+                assert _hot_tile_knobs(config.stage1) == (
+                    _HOT_TILE_KNOBS if want else _HOT_TILE_DEFAULTS
+                ), (world, epr, model_dim, inter_dim, a_dtype, tokens)
+
+
+def test_stage1_hot_tile_knobs_keep_the_pinned_digests():
+    """The knobs default off and join _LATER_STAGE_KNOBS: no pinned fused selection (V4-Pro, EP4, V4.1-EP8,
+    EP2) sets them, a digest table is the same with or without them at their defaults, and turning one on
+    changes it.
+    """
+    stage1_defaults = {
+        f.name: f.default for f in fields(type(select_fused_config(2048, 2048).stage1))
+    }
+    assert {
+        name: stage1_defaults[name] for name in _HOT_TILE_KNOBS
+    } == _HOT_TILE_DEFAULTS
+    assert set(_HOT_TILE_KNOBS) <= set(_LATER_STAGE_KNOBS)
+    shapes = ({}, V41_FLASH_EP4_SHAPE, V41_FLASH_EP8_SHAPE, V41_FLASH_EP2_SHAPE)
+    for shape in shapes:
+        for mtpr, tokens in _FUSED_CASES:
+            try:
+                stage1 = select_fused_config(tokens, mtpr, **shape).stage1
+            except ValueError:  # no fused config there, so not in that shape's digest
+                continue
+            assert _hot_tile_knobs(stage1) == _HOT_TILE_DEFAULTS, (shape, mtpr, tokens)
+            table = _stage_table(stage1)
+            assert not any(
+                isinstance(item, tuple) and item[0] in _HOT_TILE_KNOBS for item in table
+            )
+            for name, value in _HOT_TILE_KNOBS.items():
+                assert _stage_table(replace(stage1, **{name: value})) == table + (
+                    (name, value),
+                )
+    muse = select_mega_moe_config(2048, 2048, a_dtype="fp4", **MUSE_SPARK_SHAPE)
+    plan = build_mega_moe_bundle_plan(2048, a_dtype="fp4", **MUSE_SPARK_SHAPE)
+    assert muse.stage1 in plan.stage1_variants
+    assert _hot_tile_knobs(muse.stage1) == _HOT_TILE_KNOBS
+
+
 @pytest.mark.parametrize("num_xcds", (None, 1, 2, 4, 6, 8, 16))
 def test_ready_xcd_needs_eight_xcds(num_xcds):
     """ready_xcd hangs Stage1 unless every one of its 8 per-XCD counters has an XCD draining it: the plan
