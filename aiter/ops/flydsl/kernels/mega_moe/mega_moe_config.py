@@ -1182,7 +1182,8 @@ def _tune_muse_spark(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfi
     W1 half as often, and the deep Stage2 pipeline pay off from 1024 tokens a rank.
     At 512 the base SBM64 geometry stays ahead under uniform routes.
     The packed A scales drop the K-loop's serial per-byte LDS scale reads and the
-    8-column FP4 epilogue the per-pair DS swizzles and byte stores.
+    8-column FP4 epilogue the per-pair DS swizzles and byte stores. Both were validated
+    on the route-major payload only, so they stay off from INDEXED_PAYLOAD_MIN_MTPR.
     Pooled payload producers spread a hot destination (all of a rank's rows under
     expert-local routes) over every producer CTA instead of its 4, and per-XCD
     arrival-order counters keep each XCD on 2 of the 16 W1 n-slabs.
@@ -1192,10 +1193,11 @@ def _tune_muse_spark(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfi
     """
     if not ctx.apply_fp4 or ctx.mtpr_class != MAX_MTPR_CLASS or not 1024 <= ctx.bucket <= 2048:
         return config
+    route_major = ctx.mtpr < INDEXED_PAYLOAD_MIN_MTPR
     return _replace_config(
         config,
         stage1={
-            "sort_block_m": 128, "waves_per_eu_hint": 1, "ascale_packed": True, "epi_fp4_v8": True,
+            "sort_block_m": 128, "waves_per_eu_hint": 1, "ascale_packed": route_major, "epi_fp4_v8": route_major,
             "pooled_dispatch": True, "ready_xcd": True,
         },
         stage2={"block_m": 64, "b2stage": True, "deep_a_pipeline": True, "scale_forward": True,

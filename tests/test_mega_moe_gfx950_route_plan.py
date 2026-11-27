@@ -21,6 +21,7 @@ from dataclasses import MISSING, fields
 from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     DEFAULT_SMALL_M_MTPRS,
     FUSED_TOKEN_BUCKETS,
+    INDEXED_PAYLOAD_MIN_MTPR,
     LARGE_M_MIN_TOKENS,
     LARGE_M_MTPRS,
     ROUTE_LARGE_M,
@@ -875,3 +876,32 @@ def test_other_networks_staged_configs_unchanged():
                     )
     digest = hashlib.sha256(repr(sorted(table.items())).encode()).hexdigest()
     assert digest == _OTHER_STAGED_DIGEST, table
+
+
+@pytest.mark.parametrize("mtpr", (1024, 2048, 4096, 16384, 32768))
+def test_stage1_gemm1_knobs_only_muse_route_major(mtpr):
+    """ascale_packed / epi_fp4_v8: only the Muse Spark tune (FP4, buckets 1024 and 2048) sets them, and only
+    below INDEXED_PAYLOAD_MIN_MTPR, where GEMM1 reads the route-major payload they were validated on."""
+    muse = (8, 32, 4096, 4096)
+    layouts = (muse, (8, 32, 7168, 2048), (8, 48, 7168, 3072), (8, 112, 3584, 3072), (8, 32, 6144, 2048))
+    for world, epr, model_dim, inter_dim in layouts:
+        for a_dtype in ("fp4", "fp8"):
+            for tokens in range(1, mtpr + 1):
+                stage1 = select_mega_moe_config(
+                    tokens,
+                    mtpr,
+                    a_dtype=a_dtype,
+                    experts_per_rank=epr,
+                    model_dim=model_dim,
+                    inter_dim=inter_dim,
+                    world_size=world,
+                ).stage1
+                tuned = (world, epr, model_dim, inter_dim) == muse and stage1.waves_per_eu_hint == 1
+                want = tuned and mtpr < INDEXED_PAYLOAD_MIN_MTPR
+                assert (stage1.ascale_packed, stage1.epi_fp4_v8) == (want, want), (model_dim, a_dtype, tokens)
+    muse_shape = {"experts_per_rank": 32, "model_dim": 4096, "inter_dim": 4096}
+    stage1 = select_mega_moe_config(min(2048, mtpr), mtpr, a_dtype="fp4", **muse_shape).stage1
+    if mtpr >= 2048:
+        # The rest of the tune still applies on the indexed payload.
+        assert (stage1.sort_block_m, stage1.waves_per_eu_hint) == (128, 1)
+        assert stage1.ascale_packed == (mtpr < INDEXED_PAYLOAD_MIN_MTPR)
