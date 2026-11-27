@@ -374,6 +374,8 @@ _LATER_STAGE_KNOBS = (
     "pooled_dispatch",
     "ready_order",
     "ready_xcd",
+    "scale_forward",
+    "skew_normal_strided",
 )
 
 
