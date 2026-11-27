@@ -52,6 +52,9 @@ KIMI_K3_EXPERTS_PER_RANK = 112
 # are tuned in their own right.
 R1_MODEL_DIM, R1_INTER_DIM = 7168, 2048
 V4_MODEL_DIM, V4_INTER_DIM = 7168, 3072
+# EP8 Muse Spark: 256 experts, top-8.
+MUSE_SPARK_EXPERTS_PER_RANK = 32
+MUSE_SPARK_MODEL_DIM, MUSE_SPARK_INTER_DIM = 4096, 4096
 # EP4 / EP2 DeepSeek-V4.1-Flash: (world_size, experts_per_rank, model_dim, inter_dim).
 V41_FLASH_EP4_LAYOUT = (4, 96, 5120, 2304)
 V41_FLASH_EP2_LAYOUT = (2, 192, 5120, 2304)
@@ -1142,6 +1145,23 @@ def _tune_v41_flash_ep8(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoECo
     )
 
 
+def _tune_muse_spark(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
+    """Muse Spark (32 experts per rank, 4096x4096, top-8) A4W4 prefill tuning, EP8 on gfx950.
+
+    Prefill routing is skewed (the hottest expert takes ~18x the mean routes and the
+    busiest rank ~1.6x the mean), so the 128-row m-tile, which streams a hot expert's
+    W1 half as often, and the deep Stage2 pipeline pay off from 1024 tokens a rank.
+    At 512 the base SBM64 geometry stays ahead under uniform routes.
+    """
+    if not ctx.apply_fp4 or ctx.mtpr_class != MAX_MTPR_CLASS or not 1024 <= ctx.bucket <= 2048:
+        return config
+    return _replace_config(
+        config,
+        stage1={"sort_block_m": 128, "waves_per_eu_hint": 1},
+        stage2={"block_m": 64, "b2stage": True, "deep_a_pipeline": True},
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class NetworkProfile:
     """One tunable network, identified by (experts_per_rank, model_dim, inter_dim).
@@ -1195,6 +1215,13 @@ _NETWORKS = (
         fp4_prelude=True,
     ),
     NetworkProfile("v41_flash_ep8", 48, 5120, 2304, _tune_v41_flash_ep8),
+    NetworkProfile(
+        "muse_spark",
+        MUSE_SPARK_EXPERTS_PER_RANK,
+        MUSE_SPARK_MODEL_DIM,
+        MUSE_SPARK_INTER_DIM,
+        _tune_muse_spark,
+    ),
 )
 
 
