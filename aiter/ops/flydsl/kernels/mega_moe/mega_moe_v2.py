@@ -184,6 +184,13 @@ class MegaMoEV2:
             gm_indexed_payload=compact and self.mtpr >= INDEXED_PAYLOAD_MIN_MTPR,
             max_total_recv_tokens=self.world_size)
         # fmt: on
+        if post_route_norm is not None:
+            # The norm pass adds a latency-bound read of every route row; a
+            # one-block-per-CU grid hides it (2.5x faster than the default).
+            self.comb_cfg.combine_block_num = torch.cuda.get_device_properties(
+                self.dev
+            ).multi_processor_count
+            self.comb_cfg.combine_warp_num_per_block = 8
         self._build_route_arenas()
         self.comb_op = FlyDSLDispatchCombineIntraNodeOp(
             self.comb_cfg,

@@ -951,6 +951,10 @@ def make_combine_kernel(
         # Clamp denom to 1 when cur_rank_num_token == 0 (loop won't execute anyway).
         safe_token_count = (cur_rank_num_token == 0).select(1, cur_rank_num_token)
         warps_per_tok = (global_warp_num + safe_token_count - 1) // safe_token_count
+        if const_expr(post_route_norm):
+            # The route norms need whole rows; one warp per token reads them
+            # once for the norms and once to accumulate.
+            warps_per_tok = (warps_per_tok > 1).select(1, warps_per_tok)
         if const_expr(blockwise_fp8_transport):
             # Align warp partitions to the 32-value blockwise FP8 scale.
             scale_blocks = n_elems // 8
@@ -984,9 +988,7 @@ def make_combine_kernel(
             )
 
         def _route_coefs(tok_id, expert_rsrcs, expert_scale_rsrcs, expert_vlds):
-            """w_k * rsqrt(mean((g * y_k)^2) + eps) for each route slot k. Every
-            warp of a token reads its whole rows, so the coefficients do not
-            depend on the hidden-dim partition."""
+            """w_k * rsqrt(mean((g * y_k)^2) + eps) for each route slot k."""
             sumsq = [_zero_accum() for _ in range(experts_per_token)]
             for j in range_constexpr(n_elems // 64):
                 ec = lane + j * 64
