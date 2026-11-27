@@ -368,6 +368,9 @@ _FUSED_DIGEST = "f8cb680aa7ec3e668f98ed9a71a485c0bdbe703735cbf6477622cb4ae36b066
 _LATER_STAGE_KNOBS = (
     "ascale_packed",
     "epi_fp4_v8",
+    "pooled_dispatch",
+    "ready_order",
+    "ready_xcd",
 )
 
 
