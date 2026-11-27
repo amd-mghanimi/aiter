@@ -52,6 +52,9 @@ KIMI_K3_EXPERTS_PER_RANK = 112
 # are tuned in their own right.
 R1_MODEL_DIM, R1_INTER_DIM = 7168, 2048
 V4_MODEL_DIM, V4_INTER_DIM = 7168, 3072
+# EP8 Muse Spark: 256 experts, top-8.
+MUSE_SPARK_EXPERTS_PER_RANK = 32
+MUSE_SPARK_MODEL_DIM, MUSE_SPARK_INTER_DIM = 4096, 4096
 # EP4 / EP2 DeepSeek-V4.1-Flash: (world_size, experts_per_rank, model_dim, inter_dim).
 V41_FLASH_EP4_LAYOUT = (4, 96, 5120, 2304)
 V41_FLASH_EP2_LAYOUT = (2, 192, 5120, 2304)
@@ -119,7 +122,16 @@ FUSED_TOKEN_BUCKETS = tuple(b for b in TOKEN_BUCKETS if b != 2)
 LARGE_M_MIN_TOKENS = SMALL_M_MAX_MTPR + 1
 P2P_QUANT_NONE = "none"
 P2P_QUANT_FP8_BLOCKWISE = "fp8_blockwise_1x32"
-SUPPORTED_P2P_QUANT_MODES = (P2P_QUANT_NONE, P2P_QUANT_FP8_BLOCKWISE)
+# INT8 combine rows: the FP8 row layout and bytes (one E8M0 scale per 32 values), with offset int8
+# (u8 = q + 128, |q| <= 127) payload bytes. About 3.4x lower route error than E4M3. Selected
+# explicitly; "auto" never picks it, and the fused small- and large-input routes do not take it.
+P2P_QUANT_I8_BLOCKWISE = "int8_blockwise_1x32"
+SUPPORTED_P2P_QUANT_MODES = (
+    P2P_QUANT_NONE,
+    P2P_QUANT_FP8_BLOCKWISE,
+    P2P_QUANT_I8_BLOCKWISE,
+)
+BLOCKWISE_P2P_QUANT_MODES = (P2P_QUANT_FP8_BLOCKWISE, P2P_QUANT_I8_BLOCKWISE)
 
 ACTIVATION_FP4 = "fp4"
 ACTIVATION_FP8 = "fp8"
@@ -159,6 +171,39 @@ class Stage1Config:
     work_shards: int = 8
     payload_chunk_rows: int = 0
     prepare_quant_cu: int = 64
+    # GEMM1 A scales staged to LDS in K-loop order, one ds_read_b32 per row group and K-step (AScaleLoader packed).
+    ascale_packed: bool = False
+    # FP4 GEMM1 epilogue with 8 columns per lane (SiluQuantEpilogue fp4_v8); needs use_tile_resource.
+    epi_fp4_v8: bool = False
+    # Every payload producer CTA draws tasks of every destination from one counter,
+    # instead of num_dispatch_cu / world_size CTAs per destination.  Rank-local: the
+    # chunks and tile publish counts are unchanged.
+    pooled_dispatch: bool = False
+    # GEMM tile order: -1 picks payload-arrival order when one expert holds at least a
+    # quarter of the m-tiles, else sharded tile order; 0 / 1 force sharded / arrival.
+    ready_order: int = -1
+    # Arrival order with one work counter per XCD: XCD x takes n-tiles {x, x+8} of each
+    # ready m-tile (the n-tile set sharded order and static GEMM1 give it), keeping the
+    # experts' W1 slabs in its L2 instead of all 16 n-tiles of every expert in flight.
+    ready_xcd: bool = False
+    # Payload producer rows per wave step, every load of the step (route ids, tokens,
+    # scales, and the route headers: weights, plus a fanout-pair row's member expert
+    # bases) issued before its remote stores (0 = two rows, loads per row).  Loads and
+    # stores share the in-order vmcnt, so a dependent load otherwise waits out the
+    # previous rows' XGMI stores: a pair row's ~6 such waits held its producer CTA to
+    # ~2 rows/us, and a hot destination's 1536-row pair chunks finished hundreds of us
+    # after the other tasks.  Rank-local: chunks and tile publish counts are unchanged.
+    payload_batch_rows: int = 0
+    # Compact GEMM tile claims acquire the tile's payload once, on the thread that waited
+    # for it (before the CTA barrier), instead of a system-scope acquire on every thread
+    # after it.  That one buffer_inv already covers the CU's L1 and the XCD's L2 lines all
+    # the CTA's waves read through; repeating it on 8 waves cost ~4-6 us a tile in the traces.
+    acquire_once: bool = False
+    # Payload producers queue the tiles a chunk completes in consecutive arrival slots
+    # (one tail reservation per chunk) instead of one slot per tile interleaved with
+    # every other producer's tiles, so an XCD's in-flight tiles more often share W1
+    # slabs.  Queue protocol, chunks and publish counts are unchanged.
+    ready_runs: bool = False
 
 
 def stage1_bundle_identity(config: Stage1Config) -> Stage1Config:
@@ -186,6 +231,11 @@ class Stage2Config:
     pair_block_m: int = 32
     pair_block_n: int = 256
     deep_a_pipeline: bool = False
+    # Blockwise P2P rows: stage the row scales rank-locally and send each row's scale line whole from a
+    # follow-up pass (compile_mega_moe_stage2 scale_fwd_rows) instead of every n-block storing its part remotely.
+    scale_forward: bool = False
+    # skew_cu > 0: unskewed routes still take strided m-blocks (compile_mega_moe_stage2 skew_normal_strided).
+    skew_normal_strided: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -379,10 +429,10 @@ class MegaMoEConfig:
             raise ValueError(
                 f"Stage2 block_m={bm} must divide Stage1 sort_block_m={sbm}"
             )
-        if self.p2p_quant not in ("none", "fp8_blockwise_1x32"):
+        if self.p2p_quant not in SUPPORTED_P2P_QUANT_MODES:
             raise ValueError(f"unsupported p2p_quant={self.p2p_quant!r}")
         if self.p2p_quant != "none" and self.stage2.bf16_lds:
-            raise ValueError("FP8 P2P requires Stage2 bf16_lds=False")
+            raise ValueError("FP8/INT8 P2P requires Stage2 bf16_lds=False")
         if self.stage2.deep_a_pipeline and not self.stage2.b2stage:
             raise ValueError("Stage2 deep_a_pipeline requires b2stage=True")
 
@@ -400,7 +450,7 @@ class Stage2BundleKey:
             raise ValueError(
                 f"Stage2 block_m={self.config.block_m} must divide bundle SBM={self.sbm}"
             )
-        if self.p2p_quant not in ("none", "fp8_blockwise_1x32"):
+        if self.p2p_quant not in SUPPORTED_P2P_QUANT_MODES:
             raise ValueError(f"unsupported p2p_quant={self.p2p_quant!r}")
 
 
@@ -501,6 +551,20 @@ def large_m_mtprs_for(
 def small_m_cu_supported(num_cu: int) -> bool:
     """The small-input kernel splits its work over 8 XCDs by XCC id (256-CU parts)."""
     return num_cu == 256
+
+
+# Stage1Config.ready_xcd keeps one arrival-order work counter per XCD (XCC id & 7).
+READY_XCD_NUM_XCDS = 8
+
+
+def ready_xcd_supported(num_xcds: int | None) -> bool:
+    """Whether Stage1Config.ready_xcd may run on a device with ``num_xcds`` XCDs (None: unknown).
+
+    XCD x drains only its own counter, which hands out n-tiles {x, x + 8}. With fewer XCDs (CPX / DPX
+    partitions, smaller parts) some counters are never drained, their tiles never run and Stage2 waits
+    forever, so ready_xcd needs exactly READY_XCD_NUM_XCDS.
+    """
+    return num_xcds == READY_XCD_NUM_XCDS
 
 
 def small_m_mtprs_for(mtpr: int, mtprs=DEFAULT_SMALL_M_MTPRS) -> tuple[int, ...]:
@@ -939,7 +1003,7 @@ def _tune_v4_pro(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
             stage2=bucket_stage2,
         )
 
-    if config.p2p_quant == P2P_QUANT_FP8_BLOCKWISE and bucket == 1024:
+    if config.p2p_quant in BLOCKWISE_P2P_QUANT_MODES and bucket == 1024:
         config = _replace_config(
             config,
             stage1={"grid_mult": 1},
@@ -1142,6 +1206,42 @@ def _tune_v41_flash_ep8(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoECo
     )
 
 
+def _tune_muse_spark(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
+    """Muse Spark (32 experts per rank, 4096x4096, top-8) A4W4 prefill tuning, EP8 on gfx950.
+
+    Prefill routing is skewed (the hottest expert takes ~18x the mean routes and the
+    busiest rank ~1.6x the mean), so the 128-row m-tile, which streams a hot expert's
+    W1 half as often, and the deep Stage2 pipeline pay off from 1024 tokens a rank.
+    At 512 the base SBM64 geometry stays ahead under uniform routes.
+    The packed A scales drop the K-loop's serial per-byte LDS scale reads and the
+    8-column FP4 epilogue the per-pair DS swizzles and byte stores. Both were validated
+    on the route-major payload only, so they stay off from INDEXED_PAYLOAD_MIN_MTPR.
+    Pooled payload producers spread a hot destination (all of a rank's rows under
+    expert-local routes) over every producer CTA instead of its 4, and per-XCD
+    arrival-order counters keep each XCD on 2 of the 16 W1 n-slabs.  Producers batch
+    4 rows per wave step with all loads ahead of the stores (payload_batch_rows), so the
+    fanout-pair chunks no longer finish hundreds of us after the other payload tasks,
+    a tile claim acquires its payload once on the waiting thread (acquire_once), and a
+    chunk's completed tiles take consecutive arrival slots (ready_runs).
+    Stage2 is bound by its remote stores, a third of that by the 16 n-blocks' partial writes into each row's
+    one E8M0 scale line, so it stages the scales and sends each line whole (scale_forward); unskewed routes
+    keep strided m-blocks under skew_cu (skew_normal_strided).
+    """
+    if not ctx.apply_fp4 or ctx.mtpr_class != MAX_MTPR_CLASS or not 1024 <= ctx.bucket <= 2048:
+        return config
+    route_major = ctx.mtpr < INDEXED_PAYLOAD_MIN_MTPR
+    return _replace_config(
+        config,
+        stage1={
+            "sort_block_m": 128, "waves_per_eu_hint": 1, "ascale_packed": route_major, "epi_fp4_v8": route_major,
+            "pooled_dispatch": True, "ready_xcd": True, "payload_batch_rows": 4, "acquire_once": True,
+            "ready_runs": True,
+        },
+        stage2={"block_m": 64, "b2stage": True, "deep_a_pipeline": True, "scale_forward": True,
+                "skew_normal_strided": True},
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class NetworkProfile:
     """One tunable network, identified by (experts_per_rank, model_dim, inter_dim).
@@ -1195,6 +1295,13 @@ _NETWORKS = (
         fp4_prelude=True,
     ),
     NetworkProfile("v41_flash_ep8", 48, 5120, 2304, _tune_v41_flash_ep8),
+    NetworkProfile(
+        "muse_spark",
+        MUSE_SPARK_EXPERTS_PER_RANK,
+        MUSE_SPARK_MODEL_DIM,
+        MUSE_SPARK_INTER_DIM,
+        _tune_muse_spark,
+    ),
 )
 
 
@@ -1229,7 +1336,9 @@ def select_mega_moe_config(
     model_dim: int = 7168,
     inter_dim: int = 3072,
     world_size: int = 8,
+    num_xcds: int | None = READY_XCD_NUM_XCDS,
 ) -> MegaMoEConfig:
+    """``num_xcds``: the device's XCD count (None: unknown); ready_xcd is cleared unless ready_xcd_supported."""
     if a_dtype not in SUPPORTED_ACTIVATION_DTYPES:
         raise ValueError(f"unsupported activation dtype={a_dtype!r}")
     if p2p_quant not in (P2P_QUANT_AUTO, *SUPPORTED_P2P_QUANT_MODES):
@@ -1348,12 +1457,21 @@ def select_mega_moe_config(
         # is the race-safe path (only the SYNC reg->LDS copy races at SBM32+nw8)
         # and it reclaims the small-bucket cost that forcing sync would add.
         config = _replace_config(config, stage1={"async_a_copy": True})
+    if config.stage2.aligned_pair and config.p2p_quant == P2P_QUANT_I8_BLOCKWISE:
+        # The aligned-pair kernel writes FP8 rows only; an explicitly requested
+        # INT8 combine keeps the plain Stage2.
+        config = _replace_config(config, stage2={"aligned_pair": False, "pair_cu": 0})
     if config.stage2.aligned_pair and config.p2p_quant != P2P_QUANT_FP8_BLOCKWISE:
         # The aligned-pair Stage2 kernel only emits the FP8 P2P row layout, so
         # reject the combination here instead of at launch.
         raise ValueError(
             f"p2p_quant={config.p2p_quant!r} conflicts with aligned-pair Stage2"
         )
+    if config.stage1.ready_xcd and not ready_xcd_supported(num_xcds):
+        config = _replace_config(config, stage1={"ready_xcd": False})
+    if config.stage2.scale_forward and config.p2p_quant not in BLOCKWISE_P2P_QUANT_MODES:
+        # Scale forwarding sends the E8M0 scale line of blockwise P2P rows; bf16 rows have none.
+        config = _replace_config(config, stage2={"scale_forward": False})
     return config
 
 
@@ -1369,11 +1487,13 @@ def build_mega_moe_bundle_plan(
     world_size: int = 8,
     small_m_mtprs: tuple[int, ...] = (),
     large_m: bool = False,
+    num_xcds: int | None = READY_XCD_NUM_XCDS,
 ) -> MegaMoEBundlePlan:
     """Deduplicate variants while keeping Stage1/Stage2 selection atomic.
 
     ``small_m_mtprs`` / ``large_m`` add the fused routes; the caller has checked
-    the layout supports them (:func:`fused_layout_supported`).
+    the layout supports them (:func:`fused_layout_supported`). ``num_xcds``: the
+    device's XCD count, see :func:`select_mega_moe_config`.
     """
     if mtpr <= 0 or mtpr & (mtpr - 1):
         raise ValueError(f"mtpr={mtpr} must be a positive power of two")
@@ -1405,6 +1525,7 @@ def build_mega_moe_bundle_plan(
             model_dim=model_dim,
             inter_dim=inter_dim,
             world_size=world_size,
+            num_xcds=num_xcds,
         )
         stage1_key = stage1_bundle_identity(config.stage1)
         stage1_id = stage1_ids.setdefault(stage1_key, len(stage1_variants))

@@ -8,6 +8,14 @@ Accuracy against an fp32 reference, explicit and null streams, CUDA graph replay
 per-stage timing, and the opt-in edge cases (pad tail, burst, layer-slot stress,
 skewed route switch on 5+ ranks, adversarial routes, --compare-main).
 
+--suite dispatch: Stage1's pooled payload producers and per-XCD arrival order
+(pooled_dispatch / ready_xcd, the Muse Spark tune at 1024-2048 tokens a rank) under
+stress: --dispatch-rounds forwards cycling uniform / rank-local / Zipf / single-hot-expert /
+empty-destination routes, every other round with uneven per-rank tokens (ranks at 512
+tokens run the non-pooled bucket), each output compared bitwise against an instance
+whose plan has both knobs off, the pooled task counters checked to be reset after every
+call, a watchdog on hangs, then the same under CUDA graph replay.
+
 --suite routes: one instance as production builds it, at --mtpr (default 8192):
 the staged, small-input (MTPR 256 and 512) and large-input routes side by side,
 each call's route picked by forward(max_tokens=...). Accuracy against the fp32
@@ -22,6 +30,7 @@ The fused routes need an a8w4 layout of FUSED_LAYOUTS (mega_moe_config.py) on an
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --max-tok-per-rank 8192 \
         --expect-large-m --compare-main --bs-list 1,64,513,8192 --accuracy-max-bs 8192
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --suite routes
+    torchrun --nproc-per-node 8 test_mega_moe_v2.py --suite dispatch --network muse_spark --quant a4w4
     # every timed route also checked against the reference:
     torchrun --nproc-per-node 4 test_mega_moe_v2.py --suite routes --network v41_flash --check-time-acc
     torchrun --nproc-per-node 2 test_mega_moe_v2.py --suite routes --network v41_flash --check-time-acc
@@ -36,6 +45,8 @@ The routes suite takes the flags of the former test_mega_moe_small_m.py; its
 from __future__ import annotations
 
 import argparse
+import contextlib
+import faulthandler
 import os
 from dataclasses import replace
 from types import SimpleNamespace
@@ -89,6 +100,14 @@ NETWORKS = {
     "r1_v3": {
         "model_dim": 7168,
         "inter_dim": 2048,
+        "experts": 256,
+        "topk": 8,
+        "swiglu_limit": 0.0,
+    },
+    # Muse Spark A4W4 prefill geometry (EP8: 32 experts a rank, the _tune_muse_spark layout).
+    "muse_spark": {
+        "model_dim": 4096,
+        "inter_dim": 4096,
         "experts": 256,
         "topk": 8,
         "swiglu_limit": 0.0,
@@ -1757,6 +1776,237 @@ def _run_sizes(args, rank, world, device):
             )
 
 
+# ---- dispatch suite: pooled producers and per-XCD arrival order --------------
+
+_DISPATCH_PATTERNS = ("uniform", "local", "zipf", "single_hot", "empty_destination")
+# Per-rank tokens of the uneven rounds: 512 is below the pooled buckets (1024-2048).
+_DISPATCH_UNEVEN_TOKENS = (2048, 1536, 512, 1023, 2048, 512, 1024, 1900)
+# work_head words of the pooled task counter and its done count, one per parity (dispatch.POOL_*_WORD).
+_POOL_WORDS = (4, 5, 8, 9)
+
+
+@contextlib.contextmanager
+def _plain_dispatch_plans():
+    """Bundle plans built inside take pooled_dispatch and ready_xcd off (the reference instance)."""
+    from aiter.ops.flydsl.kernels.mega_moe import mega_moe_config
+
+    original = mega_moe_config.select_mega_moe_config
+
+    def select(*args, **kwargs):
+        config = original(*args, **kwargs)
+        stage1 = replace(config.stage1, pooled_dispatch=False, ready_xcd=False)
+        return replace(config, stage1=stage1)
+
+    mega_moe_config.build_mega_moe_bundle_plan.cache_clear()
+    mega_moe_config.select_mega_moe_config = select
+    try:
+        yield
+    finally:
+        mega_moe_config.select_mega_moe_config = original
+        mega_moe_config.build_mega_moe_bundle_plan.cache_clear()
+
+
+def _dispatch_route(pattern, tokens, network, world, rank, round_idx, seed, device):
+    """Inputs of one stress round; the hot experts and the empty destination are the same on every rank."""
+    experts, topk = network["experts"], network["topk"]
+    local_experts = experts // world
+    shared = torch.Generator().manual_seed(seed + 31 * round_idx)
+    owner = torch.arange(experts) // local_experts
+    weight = torch.ones(experts, dtype=torch.float64)
+    if pattern == "local":
+        weight = (owner == rank).double()
+    elif pattern == "zipf":
+        weight = 1.0 / torch.arange(1, experts + 1, dtype=torch.float64) ** 1.2
+        weight = weight[torch.randperm(experts, generator=shared)]
+    elif pattern == "single_hot":
+        weight[int(torch.randint(0, experts, (1,), generator=shared))] = 1.0e4
+    elif pattern == "empty_destination":
+        weight[owner == round_idx % world] = 0.0
+    generator = torch.Generator(device=device).manual_seed(
+        seed + 7919 * round_idx + rank
+    )
+    ids = torch.multinomial(
+        weight.to(device).expand(tokens, experts),
+        topk,
+        replacement=False,
+        generator=generator,
+    ).to(torch.int32)
+    scores = torch.randn(
+        (tokens, topk), dtype=torch.float32, device=device, generator=generator
+    )
+    x = torch.randn(
+        (tokens, network["model_dim"]), device=device, generator=generator
+    ).to(torch.bfloat16)
+    return x, scores.softmax(dim=-1).contiguous(), ids.contiguous()
+
+
+def _dispatch_instances(args, rank, world, device):
+    network = NETWORKS[args.network]
+    local_experts = network["experts"] // world
+    w1, w1_scale, w2, w2_scale = _quantize_weights(
+        network["model_dim"],
+        network["inter_dim"],
+        local_experts,
+        rank,
+        args.seed,
+        device,
+    )[:4]
+
+    def build():
+        return MegaMoEV2(
+            rank=rank,
+            world_size=world,
+            quant=args.quant,
+            w1=w1,
+            w1_scale=w1_scale,
+            w2=w2,
+            w2_scale=w2_scale,
+            max_tok_per_rank=args.max_tok_per_rank,
+            stage2_p2p_quant=args.stage2_p2p_quant,
+            large_m_enabled=False,
+            small_m_mtprs=(),
+            **network,
+        )
+
+    pooled = build()
+    with _plain_dispatch_plans():
+        plain = build()
+    knobs = [
+        (e.config.stage1.pooled_dispatch, e.config.stage1.ready_xcd)
+        for e in pooled._bundle_plan.entries
+    ]
+    if not any(p for p, _ in knobs):
+        raise ValueError(
+            f"{args.network} {args.quant} mtpr={args.max_tok_per_rank} selects no "
+            "pooled_dispatch bucket (the Muse tune: --network muse_spark --quant a4w4)"
+        )
+    if any(
+        e.config.stage1.pooled_dispatch or e.config.stage1.ready_xcd
+        for e in plain._bundle_plan.entries
+    ):
+        raise AssertionError("the reference plan kept pooled_dispatch / ready_xcd")
+    return pooled, plain
+
+
+def _pool_counters_clear(moe):
+    work_head = moe._s1_dispatch_workspace["work_head"]
+    return not any(int(work_head[w]) for w in _POOL_WORDS)
+
+
+def _dispatch_round_tokens(round_idx, rank, mtpr):
+    """Even rounds: every rank at one token count; odd rounds: uneven per-rank counts."""
+    if round_idx % 2 == 0:
+        return min(mtpr, (2048, 1024, 1536)[(round_idx // 2) % 3]), "even"
+    return min(mtpr, _DISPATCH_UNEVEN_TOKENS[(rank + round_idx) % 8]), "uneven"
+
+
+def _run_dispatch(args, rank, world, device):
+    pooled, plain = _dispatch_instances(args, rank, world, device)
+    network = NETWORKS[args.network]
+    if rank == 0:
+        buckets = [
+            e.token_bucket
+            for e in pooled._bundle_plan.entries
+            if e.config.stage1.pooled_dispatch
+        ]
+        print(
+            f"[SETUP] network={args.network} quant={args.quant} mtpr={pooled.mtpr} "
+            f"world={world} pooled buckets={buckets} rounds={args.dispatch_rounds}",
+            flush=True,
+        )
+    failures = []
+    for round_idx in range(args.dispatch_rounds):
+        faulthandler.dump_traceback_later(args.dispatch_timeout, exit=True)
+        pattern = _DISPATCH_PATTERNS[round_idx % len(_DISPATCH_PATTERNS)]
+        tokens, kind = _dispatch_round_tokens(round_idx, rank, pooled.mtpr)
+        x, w, ids = _dispatch_route(
+            pattern, tokens, network, world, rank, round_idx, args.seed, device
+        )
+        output = _fwd(pooled, x, w, ids)[:tokens].clone()
+        reference = _fwd(plain, x, w, ids)[:tokens]
+        torch.cuda.synchronize()
+        stat = torch.tensor(
+            [
+                int((output != reference).any(dim=-1).sum()),
+                int(not _pool_counters_clear(pooled)),
+            ],
+            device=device,
+        )
+        dist.all_reduce(stat)
+        if int(stat.sum()):
+            failures.append(
+                f"round={round_idx} {pattern} {kind} mismatched_rows={int(stat[0])} "
+                f"ranks_with_pool_counters_left={int(stat[1])}"
+            )
+            if len(failures) >= 8:
+                break
+        if rank == 0 and (round_idx + 1) % 500 == 0:
+            print(
+                f"[DISPATCH] {round_idx + 1} rounds, {len(failures)} failed", flush=True
+            )
+    faulthandler.cancel_dump_traceback_later()
+    _barrier()
+    failures += _dispatch_graph(pooled, plain, network, args, rank, world, device)
+    _barrier()
+    if failures:
+        raise AssertionError("FAILED: " + "; ".join(failures))
+    if rank == 0:
+        print(
+            f"[RESULT] dispatch rounds={args.dispatch_rounds} graph_reps={args.dispatch_graph_reps} "
+            "bitwise vs pooled_dispatch=ready_xcd=False, pool counters reset: ALL PASS",
+            flush=True,
+        )
+
+
+def _dispatch_graph(pooled, plain, network, args, rank, world, device):
+    """Both instances in one CUDA graph at uneven fixed per-rank tokens, replayed on new routes."""
+    tokens = min(pooled.mtpr, _DISPATCH_UNEVEN_TOKENS[rank % 8])
+    sx, sw, si = _dispatch_route(
+        "uniform", tokens, network, world, rank, 0, args.seed, device
+    )
+    outputs = []
+
+    def body():
+        outputs.clear()
+        outputs.append(_fwd(pooled, sx, sw, si)[:tokens].clone())
+        outputs.append(_fwd(plain, sx, sw, si)[:tokens].clone())
+
+    body()
+    _barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=torch.cuda.Stream()):
+        body()
+    failures = []
+    for rep in range(args.dispatch_graph_reps):
+        faulthandler.dump_traceback_later(args.dispatch_timeout, exit=True)
+        pattern = _DISPATCH_PATTERNS[rep % len(_DISPATCH_PATTERNS)]
+        x, w, ids = _dispatch_route(
+            pattern, tokens, network, world, rank, 10_000 + rep, args.seed, device
+        )
+        sx.copy_(x)
+        sw.copy_(w)
+        si.copy_(ids)
+        _barrier()
+        graph.replay()
+        torch.cuda.synchronize()
+        stat = torch.tensor(
+            [
+                int((outputs[0] != outputs[1]).any(dim=-1).sum()),
+                int(not _pool_counters_clear(pooled)),
+            ],
+            device=device,
+        )
+        dist.all_reduce(stat)
+        if int(stat.sum()):
+            failures.append(
+                f"graph rep={rep} {pattern} mismatched_rows={int(stat[0])} "
+                f"ranks_with_pool_counters_left={int(stat[1])}"
+            )
+    faulthandler.cancel_dump_traceback_later()
+    del graph
+    return failures
+
+
 def _int_list(text):
     return [int(value) for value in text.split(",") if value]
 
@@ -1767,10 +2017,10 @@ def main():
     )
     parser.add_argument(
         "--suite",
-        choices=("size", "routes"),
+        choices=("size", "routes", "dispatch"),
         default="size",
         help="size: one pinned-route instance per batch size; routes: the production "
-        "instance, its route picked by max_tokens",
+        "instance, its route picked by max_tokens; dispatch: pooled-producer stress",
     )
     parser.add_argument("--network", choices=NETWORKS, default="v4_pro")
     parser.add_argument("--quant", choices=("a4w4", "a8w4"), default="a8w4")
@@ -1799,7 +2049,7 @@ def main():
     size = parser.add_argument_group("size suite")
     size.add_argument(
         "--stage2-p2p-quant",
-        choices=("auto", "none", "fp8_blockwise_1x32"),
+        choices=("auto", "none", "fp8_blockwise_1x32", "int8_blockwise_1x32"),
         default="auto",
     )
     size.add_argument("--bs-list", default="128")
@@ -1826,6 +2076,15 @@ def main():
     size.add_argument("--smoke-only", action="store_true")
     size.add_argument("--layer-stress-cycles", type=int, default=0)
     size.add_argument("--route-switch-rounds", type=int, default=0)
+    dispatch = parser.add_argument_group("dispatch suite")
+    dispatch.add_argument("--dispatch-rounds", type=int, default=2000)
+    dispatch.add_argument("--dispatch-graph-reps", type=int, default=50)
+    dispatch.add_argument(
+        "--dispatch-timeout",
+        type=float,
+        default=300.0,
+        help="seconds a round may take before the watchdog dumps the stacks and exits",
+    )
     routes = parser.add_argument_group("routes suite")
     routes.add_argument(
         "--small-m-mtprs",
@@ -1869,6 +2128,14 @@ def main():
         if args.large_m_state_slots is None:
             args.large_m_state_slots = 61
         run = _run_routes
+    elif args.suite == "dispatch":
+        if get_gfx() != "gfx950":
+            print(f"[SKIP] the pooled dispatch tune needs gfx950, got {get_gfx()}")
+            return
+        args.seed = 11 if args.seed is None else args.seed
+        if args.max_tok_per_rank is None:
+            args.max_tok_per_rank = 2048
+        run = _run_dispatch
     else:
         if args.route_switch_rounds and not (args.expect_large_m and args.smoke_only):
             raise ValueError(

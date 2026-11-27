@@ -15,14 +15,18 @@ import pytest
 pytest.importorskip("flydsl", reason="MegaMoE is built with FlyDSL")
 pytest.importorskip("mori.shmem", reason="MegaMoE's runtime imports mori")
 
+import contextlib
 import hashlib
-from dataclasses import astuple, fields
+from dataclasses import MISSING, fields, replace
 
 from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
+    BLOCKWISE_P2P_QUANT_MODES,
     DEFAULT_SMALL_M_MTPRS,
     FUSED_TOKEN_BUCKETS,
+    INDEXED_PAYLOAD_MIN_MTPR,
     LARGE_M_MIN_TOKENS,
     LARGE_M_MTPRS,
+    READY_XCD_NUM_XCDS,
     ROUTE_LARGE_M,
     ROUTE_SMALL_M,
     ROUTE_STAGED,
@@ -32,7 +36,10 @@ from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     build_mega_moe_bundle_plan,
     fused_layout_supported,
     large_m_mtprs_for,
+    nearest_token_bucket,
+    ready_xcd_supported,
     select_fused_config,
+    select_mega_moe_config,
     small_m_cu_supported,
     small_m_mtprs_for,
 )
@@ -360,6 +367,33 @@ _FUSED_CASES = (
     (16384, 16384),
 )
 _FUSED_DIGEST = "f8cb680aa7ec3e668f98ed9a71a485c0bdbe703735cbf6477622cb4ae36b0666"
+# Stage1Config / Stage2Config fields added after the digests were pinned: they enter the tables only when set,
+# so a pinned digest changes only where a config sets one.
+_LATER_STAGE_KNOBS = (
+    "ascale_packed",
+    "epi_fp4_v8",
+    "pooled_dispatch",
+    "ready_order",
+    "ready_xcd",
+    "payload_batch_rows",
+    "acquire_once",
+    "ready_runs",
+    "scale_forward",
+    "skew_normal_strided",
+)
+
+
+def _stage_table(stage):
+    """astuple(stage), with the _LATER_STAGE_KNOBS appended as (name, value) only when not at their default."""
+    return tuple(
+        getattr(stage, f.name)
+        for f in fields(stage)
+        if f.name not in _LATER_STAGE_KNOBS
+    ) + tuple(
+        (f.name, getattr(stage, f.name))
+        for f in fields(stage)
+        if f.name in _LATER_STAGE_KNOBS and getattr(stage, f.name) != f.default
+    )
 
 
 def test_fused_configs_unchanged():
@@ -367,8 +401,8 @@ def test_fused_configs_unchanged():
     for mtpr, tokens in _FUSED_CASES:
         config = select_fused_config(tokens, mtpr)
         table[(mtpr, tokens)] = (
-            astuple(config.stage1),
-            astuple(config.stage2),
+            _stage_table(config.stage1),
+            _stage_table(config.stage2),
             config.p2p_quant,
         )
     digest = hashlib.sha256(repr(sorted(table.items())).encode()).hexdigest()
@@ -418,8 +452,8 @@ _EP2_KNOBS = ("stream_w",)
 
 def _knob_table(config):
     return (
-        astuple(config.stage1),
-        astuple(config.stage2),
+        _stage_table(config.stage1),
+        _stage_table(config.stage2),
         config.p2p_quant,
         tuple(
             (f.name, getattr(config.fused_stage1, f.name))
@@ -763,3 +797,350 @@ def test_ep2_fused_configs_unchanged():
         )
     digest = hashlib.sha256(repr(sorted(table.items())).encode()).hexdigest()
     assert digest == _EP2_FUSED_DIGEST, table
+
+
+# Muse Spark (EP8: 256 experts, top-8, 4096 x 4096 experts), the shape _tune_muse_spark tunes.
+MUSE_SPARK_SHAPE = {"experts_per_rank": 32, "model_dim": 4096, "inter_dim": 4096}
+
+
+def _muse_tuned(config):
+    """The tune's signature: no base config pairs one wave per EU with the deep Stage2 at these buckets."""
+    return (
+        config.stage1.waves_per_eu_hint == 1
+        and config.stage2.b2stage
+        and config.stage2.deep_a_pipeline
+    )
+
+
+@pytest.mark.parametrize("mtpr", (1024, 2048, 4096, 32768))
+@pytest.mark.parametrize("a_dtype", ("fp4", "fp8"))
+def test_muse_spark_tune_gate(mtpr, a_dtype):
+    """Only FP4 activations at mtpr >= 2048 (the max capacity class) and buckets 1024 / 2048 take the tune."""
+    for tokens in range(1, mtpr + 1):
+        config = select_mega_moe_config(
+            tokens, mtpr, a_dtype=a_dtype, **MUSE_SPARK_SHAPE
+        )
+        in_buckets = nearest_token_bucket(tokens) in (1024, 2048)
+        assert in_buckets == (768 <= tokens <= 3071), tokens
+        want = a_dtype == "fp4" and mtpr >= 2048 and in_buckets
+        assert _muse_tuned(config) == want, tokens
+        if want:
+            assert config.stage1.sort_block_m == 128, tokens
+            assert config.stage2.block_m == 64, tokens
+
+
+# Every other layout's staged selection (the registered networks, their EPLB profiles, and shapes sharing part
+# of Muse's identity), as on main (aa62b8657) before the Muse profile. A config enters by its non-default fields,
+# so knobs added later with a default value leave the digest alone. On a mismatch the assertion shows the table.
+_OTHER_LAYOUTS = (
+    # (world_size, experts_per_rank, model_dim, inter_dim)
+    (8, 32, 7168, 2048),  # R1
+    (8, 48, 7168, 3072),  # V4-Pro
+    (8, 52, 7168, 3072),  # V4-Pro EPLB
+    (8, 56, 7168, 3072),  # V4-Pro EPLB
+    (8, 112, 3584, 3072),  # Kimi-K3
+    (2, 192, 5120, 2304),  # V4.1-Flash EP2
+    (4, 96, 5120, 2304),  # V4.1-Flash EP4
+    (8, 48, 5120, 2304),  # V4.1-Flash EP8
+    (8, 32, 6144, 2048),  # GLM-5.2: Muse's experts per rank
+    (8, 32, 4096, 2048),  # Muse's experts per rank and model_dim
+    (4, 64, 4096, 4096),  # Muse's expert shape
+)
+_OTHER_STAGED_DIGEST = (
+    "f70d94ae2ed25cdc45eacc96a483c784d100652adab523076d6428042bcb8bbc"
+)
+
+
+def _set_fields(obj):
+    return tuple(
+        (f.name, getattr(obj, f.name))
+        for f in fields(obj)
+        if f.default is MISSING or getattr(obj, f.name) != f.default
+    )
+
+
+def test_other_networks_staged_configs_unchanged():
+    table = {}
+    for world, epr, model_dim, inter_dim in _OTHER_LAYOUTS:
+        for a_dtype in ("fp4", "fp8"):
+            for mtpr in (1 << i for i in range(16)):
+                tokens = {
+                    t
+                    for b in TOKEN_BUCKETS
+                    for t in (b - 1, b, b + 1, 3 * b // 4, 3 * b // 2 - 1, 3 * b // 2)
+                    if 1 <= t <= mtpr
+                }
+                for t in sorted(tokens):
+                    key = (world, epr, model_dim, inter_dim, a_dtype, mtpr, t)
+                    try:
+                        config = select_mega_moe_config(
+                            t,
+                            mtpr,
+                            a_dtype=a_dtype,
+                            experts_per_rank=epr,
+                            model_dim=model_dim,
+                            inter_dim=inter_dim,
+                            world_size=world,
+                        )
+                    except ValueError as exc:
+                        table[key] = type(exc).__name__
+                        continue
+                    table[key] = (
+                        _set_fields(config.stage1),
+                        _set_fields(config.stage2),
+                        config.p2p_quant,
+                        _set_fields(config.fused_stage1),
+                        _set_fields(config.fused_stage2),
+                    )
+    digest = hashlib.sha256(repr(sorted(table.items())).encode()).hexdigest()
+    assert digest == _OTHER_STAGED_DIGEST, table
+
+
+@pytest.mark.parametrize("mtpr", (1024, 2048, 4096, 16384, 32768))
+def test_stage1_gemm1_knobs_only_muse_route_major(mtpr):
+    """ascale_packed / epi_fp4_v8: only the Muse Spark tune (FP4, buckets 1024 and 2048) sets them, and only
+    below INDEXED_PAYLOAD_MIN_MTPR, where GEMM1 reads the route-major payload they were validated on.
+    """
+    muse = (8, 32, 4096, 4096)
+    layouts = (
+        muse,
+        (8, 32, 7168, 2048),
+        (8, 48, 7168, 3072),
+        (8, 112, 3584, 3072),
+        (8, 32, 6144, 2048),
+    )
+    for world, epr, model_dim, inter_dim in layouts:
+        for a_dtype in ("fp4", "fp8"):
+            for tokens in range(1, mtpr + 1):
+                stage1 = select_mega_moe_config(
+                    tokens,
+                    mtpr,
+                    a_dtype=a_dtype,
+                    experts_per_rank=epr,
+                    model_dim=model_dim,
+                    inter_dim=inter_dim,
+                    world_size=world,
+                ).stage1
+                tuned = (
+                    world,
+                    epr,
+                    model_dim,
+                    inter_dim,
+                ) == muse and stage1.waves_per_eu_hint == 1
+                want = tuned and mtpr < INDEXED_PAYLOAD_MIN_MTPR
+                assert (stage1.ascale_packed, stage1.epi_fp4_v8) == (want, want), (
+                    model_dim,
+                    a_dtype,
+                    tokens,
+                )
+    muse_shape = {"experts_per_rank": 32, "model_dim": 4096, "inter_dim": 4096}
+    stage1 = select_mega_moe_config(
+        min(2048, mtpr), mtpr, a_dtype="fp4", **muse_shape
+    ).stage1
+    if mtpr >= 2048:
+        # The rest of the tune still applies on the indexed payload.
+        assert (stage1.sort_block_m, stage1.waves_per_eu_hint) == (128, 1)
+        assert stage1.ascale_packed == (mtpr < INDEXED_PAYLOAD_MIN_MTPR)
+
+
+# Stage1 hot-rank tile knobs, as _tune_muse_spark sets them, and their defaults.
+_HOT_TILE_KNOBS = {"payload_batch_rows": 4, "acquire_once": True, "ready_runs": True}
+_HOT_TILE_DEFAULTS = {
+    "payload_batch_rows": 0,
+    "acquire_once": False,
+    "ready_runs": False,
+}
+
+
+def _hot_tile_knobs(stage1):
+    return {name: getattr(stage1, name) for name in _HOT_TILE_KNOBS}
+
+
+@pytest.mark.parametrize("mtpr", (1024, 2048, 4096, 16384, 32768))
+def test_stage1_hot_tile_knobs_only_muse_tune(mtpr):
+    """payload_batch_rows / acquire_once / ready_runs: only the Muse Spark tune (FP4, mtpr >= 2048, buckets
+    1024 and 2048) sets them, on the route-major and the indexed payload alike; every other selection keeps
+    the defaults, which leave the kernels as before.
+    """
+    muse = (8, 32, 4096, 4096)
+    layouts = (
+        muse,
+        (8, 32, 7168, 2048),
+        (8, 48, 7168, 3072),
+        (8, 112, 3584, 3072),
+        (8, 32, 6144, 2048),
+        (8, 32, 4096, 2048),
+        (4, 64, 4096, 4096),
+    )
+    for world, epr, model_dim, inter_dim in layouts:
+        for a_dtype in ("fp4", "fp8"):
+            for tokens in range(1, mtpr + 1):
+                config = select_mega_moe_config(
+                    tokens,
+                    mtpr,
+                    a_dtype=a_dtype,
+                    experts_per_rank=epr,
+                    model_dim=model_dim,
+                    inter_dim=inter_dim,
+                    world_size=world,
+                )
+                want = (
+                    (world, epr, model_dim, inter_dim) == muse
+                    and a_dtype == "fp4"
+                    and mtpr >= 2048
+                    and nearest_token_bucket(tokens) in (1024, 2048)
+                )
+                assert want == (
+                    (world, epr, model_dim, inter_dim) == muse and _muse_tuned(config)
+                )
+                assert _hot_tile_knobs(config.stage1) == (
+                    _HOT_TILE_KNOBS if want else _HOT_TILE_DEFAULTS
+                ), (world, epr, model_dim, inter_dim, a_dtype, tokens)
+
+
+def test_stage1_hot_tile_knobs_keep_the_pinned_digests():
+    """The knobs default off and join _LATER_STAGE_KNOBS: no pinned fused selection (V4-Pro, EP4, V4.1-EP8,
+    EP2) sets them, a digest table is the same with or without them at their defaults, and turning one on
+    changes it.
+    """
+    stage1_defaults = {
+        f.name: f.default for f in fields(type(select_fused_config(2048, 2048).stage1))
+    }
+    assert {
+        name: stage1_defaults[name] for name in _HOT_TILE_KNOBS
+    } == _HOT_TILE_DEFAULTS
+    assert set(_HOT_TILE_KNOBS) <= set(_LATER_STAGE_KNOBS)
+    shapes = ({}, V41_FLASH_EP4_SHAPE, V41_FLASH_EP8_SHAPE, V41_FLASH_EP2_SHAPE)
+    for shape in shapes:
+        for mtpr, tokens in _FUSED_CASES:
+            try:
+                stage1 = select_fused_config(tokens, mtpr, **shape).stage1
+            except ValueError:  # no fused config there, so not in that shape's digest
+                continue
+            assert _hot_tile_knobs(stage1) == _HOT_TILE_DEFAULTS, (shape, mtpr, tokens)
+            table = _stage_table(stage1)
+            assert not any(
+                isinstance(item, tuple) and item[0] in _HOT_TILE_KNOBS for item in table
+            )
+            for name, value in _HOT_TILE_KNOBS.items():
+                assert _stage_table(replace(stage1, **{name: value})) == table + (
+                    (name, value),
+                )
+    muse = select_mega_moe_config(2048, 2048, a_dtype="fp4", **MUSE_SPARK_SHAPE)
+    plan = build_mega_moe_bundle_plan(2048, a_dtype="fp4", **MUSE_SPARK_SHAPE)
+    assert muse.stage1 in plan.stage1_variants
+    assert _hot_tile_knobs(muse.stage1) == _HOT_TILE_KNOBS
+
+
+@pytest.mark.parametrize("num_xcds", (None, 1, 2, 4, 6, 8, 16))
+def test_ready_xcd_needs_eight_xcds(num_xcds):
+    """ready_xcd hangs Stage1 unless every one of its 8 per-XCD counters has an XCD draining it: the plan
+    for a device with another (or an unknown) XCD count clears it and changes nothing else.
+    """
+    muse = {
+        "a_dtype": "fp4",
+        "experts_per_rank": 32,
+        "model_dim": 4096,
+        "inter_dim": 4096,
+    }
+    assert READY_XCD_NUM_XCDS == 8
+    assert ready_xcd_supported(num_xcds) == (num_xcds == 8)
+    plan = build_mega_moe_bundle_plan(2048, num_xcds=num_xcds, **muse)
+    default = build_mega_moe_bundle_plan(2048, **muse)
+    ready = {
+        entry.token_bucket for entry in plan.entries if entry.config.stage1.ready_xcd
+    }
+    assert {
+        entry.token_bucket for entry in default.entries if entry.config.stage1.ready_xcd
+    } == {1024, 2048}
+    assert ready == ({1024, 2048} if num_xcds == 8 else set())
+    for entry, default_entry in zip(plan.entries, default.entries, strict=True):
+        assert entry.config.stage2 == default_entry.config.stage2
+        assert replace(entry.config.stage1, ready_xcd=False) == replace(
+            default_entry.config.stage1, ready_xcd=False
+        )
+    assert (
+        not any(variant.ready_xcd for variant in plan.stage1_variants) or num_xcds == 8
+    )
+
+
+def test_megamoe_v2_reads_the_device_xcd_count(monkeypatch):
+    """MegaMoEV2 plans with the device's XCD count (chip_info), and with None when the runtime cannot tell."""
+    from aiter.ops.flydsl.kernels.mega_moe import mega_moe_v2
+
+    monkeypatch.setattr(
+        mega_moe_v2.torch.cuda, "device", lambda device: contextlib.nullcontext()
+    )
+    seen = []
+
+    def num_xcds(default):
+        seen.append(default)
+        return 4
+
+    monkeypatch.setattr(mega_moe_v2, "get_num_xcds", num_xcds)
+    assert mega_moe_v2._device_num_xcds("cuda:0") == 4
+    # A count the plan depends on must not fall back to chip_info's default of 8.
+    assert seen == [None]
+
+    def no_attribute(default):
+        raise RuntimeError("HIP runtime predates hipDeviceAttributeNumberOfXccs")
+
+    monkeypatch.setattr(mega_moe_v2, "get_num_xcds", no_attribute)
+    assert mega_moe_v2._device_num_xcds("cuda:0") is None
+
+
+_MUSE_FP4 = {
+    "a_dtype": "fp4",
+    "experts_per_rank": 32,
+    "model_dim": 4096,
+    "inter_dim": 4096,
+}
+
+
+@pytest.mark.parametrize("mtpr", (1024, 2048, 4096, 32768))
+@pytest.mark.parametrize(
+    "p2p_quant", ("auto", "none", "fp8_blockwise_1x32", "int8_blockwise_1x32")
+)
+def test_scale_forward_needs_blockwise_rows(p2p_quant, mtpr):
+    """Stage2 scale forwarding sends the E8M0 scale line of blockwise P2P rows (compile_mega_moe_stage2
+    rejects it otherwise): the Muse tune requests it only with FP8 / INT8 rows, never with bf16 rows.
+    """
+    if p2p_quant == "none" and mtpr >= 8192:
+        # The base bucket-8192 config takes the aligned-pair Stage2, which writes FP8 rows only.
+        with pytest.raises(ValueError, match="conflicts with aligned-pair Stage2"):
+            build_mega_moe_bundle_plan(mtpr, p2p_quant=p2p_quant, **_MUSE_FP4)
+        return
+    plan = build_mega_moe_bundle_plan(mtpr, p2p_quant=p2p_quant, **_MUSE_FP4)
+    tuned = 0
+    for entry in plan.entries:
+        config = entry.config
+        if config.stage1.waves_per_eu_hint == 1 and config.stage2.deep_a_pipeline:
+            tuned += 1
+            assert config.stage2.block_m == 64, entry.token_bucket
+        want = bool(tuned) and entry.token_bucket in (1024, 2048)
+        want = want and config.p2p_quant in BLOCKWISE_P2P_QUANT_MODES
+        assert config.stage2.scale_forward == want, (
+            entry.token_bucket,
+            config.p2p_quant,
+        )
+    assert tuned == (2 if mtpr >= 2048 else 0)
+    if p2p_quant == "none":
+        assert {entry.config.p2p_quant for entry in plan.entries} == {"none"}
+    # The small-input kernels' "dynamic" rows never come from the staged config.
+    with pytest.raises(ValueError, match="unsupported p2p_quant"):
+        select_mega_moe_config(min(2048, mtpr), mtpr, p2p_quant="dynamic", **_MUSE_FP4)
+
+
+def test_megamoe_v2_scale_forward_needs_blockwise_rows():
+    """MegaMoEV2 launches the forward pass only for blockwise rows, also for a config patched past the
+    selection rules (e.g. a scale_forward override over bf16 rows)."""
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_v2 import MegaMoEV2
+
+    for p2p_quant in BLOCKWISE_P2P_QUANT_MODES:
+        config = select_mega_moe_config(2048, 2048, p2p_quant=p2p_quant, **_MUSE_FP4)
+        assert config.stage2.scale_forward
+        assert MegaMoEV2._uses_scale_forward(config, runtime_pair_skip=False)
+        assert not MegaMoEV2._uses_scale_forward(config, runtime_pair_skip=True)
+        assert not MegaMoEV2._uses_scale_forward(
+            replace(config, p2p_quant="none"), runtime_pair_skip=False
+        )

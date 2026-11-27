@@ -41,7 +41,8 @@ _SUPPORTED_TOK_DTYPES = (
 _SUPPORTED_QUANT_TYPES = ("none", "fp8_direct_cast")
 # "fp8_blockwise_1x32" is what the gfx1250 path calls combine_quant="mxfp8"
 # (mega_moe_gfx1250/recipe.py).
-_SUPPORTED_STAGE2_P2P_QUANT_TYPES = ("none", "fp8_blockwise_1x32")
+# "int8_blockwise_1x32" keeps that row layout with offset int8 (u8 = q + 128) bytes.
+_SUPPORTED_STAGE2_P2P_QUANT_TYPES = ("none", "fp8_blockwise_1x32", "int8_blockwise_1x32")
 
 _MAX_INTRANODE_NPES = 8
 
@@ -1386,7 +1387,18 @@ class FlyDSLDispatchCombineIntraNodeOp:
         return cur_tok
 
     def _run_combine_kernel(
-        self, cache, key, fn, inp_ptr, wts_ptr, prx_ptr, cur_tok, stream, tok_map=None
+        self,
+        cache,
+        key,
+        fn,
+        inp_ptr,
+        wts_ptr,
+        prx_ptr,
+        cur_tok,
+        stream,
+        tok_map=None,
+        route_wts_ptr=0,
+        norm_gain_ptr=0,
     ):
         """Compile once and reuse the cached combine launcher."""
         fixed = (
@@ -1413,6 +1425,8 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 *tail,
                 fx.Int64(prx_ptr),
                 *std,
+                fx.Int64(route_wts_ptr),
+                fx.Int64(norm_gain_ptr),
                 cur_tok,
                 stream,
             )
@@ -1424,6 +1438,8 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 *tail,
                 prx_ptr,
                 *std,
+                route_wts_ptr,
+                norm_gain_ptr,
                 cur_tok,
                 stream,
             )
@@ -1438,6 +1454,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
         enable_weights,
         skip_stage1,
         stage2_p2p_quant=None,
+        post_route_norm=None,
     ):
         """Launch regular or skip-stage1 combine."""
         cfg = self.cfg
@@ -1446,6 +1463,11 @@ class FlyDSLDispatchCombineIntraNodeOp:
         self._check_combine_inputs(
             input, weights, indices, packed_recv_x, strict_input_dtype=not skip_stage1
         )
+        norm_eps = None
+        if post_route_norm is not None:
+            route_wts, norm_gain, norm_eps = post_route_norm
+            norm_eps = float(norm_eps)
+            self._check_post_route_norm(route_wts, norm_gain, skip_stage1, cur_tok)
 
         # fp8_direct_cast fires only when cfg asks AND launch dtype is bf16.
         fp8_dc = (
@@ -1461,6 +1483,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 f"Supported: {_SUPPORTED_STAGE2_P2P_QUANT_TYPES}"
             )
         blockwise_fp8 = skip_stage1 and p2p_quant == "fp8_blockwise_1x32"
+        blockwise_i8 = skip_stage1 and p2p_quant == "int8_blockwise_1x32"
         # Fused-upstream combine: top-k ids mask never-dispatched (-1) slots.
         mask_topk_ids = skip_stage1 and indices is not None and not cfg.zero_copy
         if mask_topk_ids and (
@@ -1524,10 +1547,12 @@ class FlyDSLDispatchCombineIntraNodeOp:
             bool(enable_weights),
             bool(fp8_dc),
             bool(blockwise_fp8),
+            bool(blockwise_i8),
             bn,
             wpb,
             bool(skip_stage1),
             bool(mask_topk_ids),
+            norm_eps,
         )
         fn = self._comb_jit_cache.get(key)
         if fn is None:
@@ -1546,9 +1571,12 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 skip_stage1=bool(skip_stage1),
                 fp8_direct_cast=bool(fp8_dc),
                 blockwise_fp8_transport=bool(blockwise_fp8),
+                blockwise_i8_transport=bool(blockwise_i8),
                 # Must match dispatch's encoding stride so tok_map decode lines up.
                 max_recv=self._effective_max_recv,
                 mask_topk_ids=bool(mask_topk_ids),
+                post_route_norm=norm_eps is not None,
+                post_route_norm_eps=1e-6 if norm_eps is None else norm_eps,
             )
             self._comb_jit_cache[key] = fn
         self._run_combine_kernel(
@@ -1562,6 +1590,8 @@ class FlyDSLDispatchCombineIntraNodeOp:
             stream,
             # Masking reads the caller's top-k ids in place of the dispatch tok_map.
             tok_map=fx.Int64(indices.data_ptr()) if mask_topk_ids else None,
+            route_wts_ptr=0 if norm_eps is None else route_wts.data_ptr(),
+            norm_gain_ptr=0 if norm_eps is None else norm_gain.data_ptr(),
         )
 
         mt = cfg.max_num_inp_token_per_rank
@@ -1607,11 +1637,17 @@ class FlyDSLDispatchCombineIntraNodeOp:
         cur_tok=None,
         enable_weights: bool = True,
         stage2_p2p_quant=None,
+        post_route_norm=None,
     ):
         """Run combine after fused GEMM2 has populated the P2P input.
 
         ``indices``: optional int32 [cur_tok, topk] top-k ids; slots with id -1
         (never dispatched) are skipped instead of summing a stale partial.
+
+        ``post_route_norm``: optional ``(route_wts, gain, eps)`` for routes
+        written unweighted: the output is ``sum_k w_k * rms_norm(gain * y_k)``
+        with ``route_wts`` this rank's f32 ``[cur_tok, topk]`` router weights
+        and ``gain`` f32 ``[hidden_dim]``.
         """
         if not type(self)._ENABLE_COMBINE_NO_STAGE1:
             raise NotImplementedError(
@@ -1629,7 +1665,28 @@ class FlyDSLDispatchCombineIntraNodeOp:
             enable_weights=enable_weights,
             skip_stage1=True,
             stage2_p2p_quant=stage2_p2p_quant,
+            post_route_norm=post_route_norm,
         )
+
+    def _check_post_route_norm(self, route_wts, norm_gain, skip_stage1, cur_tok):
+        cfg = self.cfg
+        if not skip_stage1 or cfg.zero_copy:
+            raise ValueError("post_route_norm needs combine_no_stage1 without zero_copy")
+        if cfg.combine_dtype != torch.bfloat16:
+            raise ValueError("post_route_norm needs combine_dtype=torch.bfloat16")
+        rows = self._resolve_cur_tok(cur_tok, "combine_no_stage1()")
+        k = cfg.num_experts_per_token
+        for name, t, shape in (
+            ("route_wts", route_wts, (rows, k)),
+            ("gain", norm_gain, (cfg.hidden_dim,)),
+        ):
+            self._check_tensor_device(name, t)
+            if t.dtype != torch.float32 or not t.is_contiguous():
+                raise ValueError(f"post_route_norm {name} must be contiguous float32")
+            if t.dim() != len(shape) or t.shape[0] < shape[0] or t.shape[1:] != shape[1:]:
+                raise ValueError(
+                    f"post_route_norm {name} shape {tuple(t.shape)} does not cover {shape}"
+                )
 
     def preload_combine_no_stage1(
         self,
@@ -1639,6 +1696,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
         enable_weights: bool = False,
         stage2_p2p_quant=None,
         mask_topk_ids: bool = False,
+        post_route_norm_eps=None,
     ):
         """Compile and load one fused-Stage2 combine geometry without launching it."""
         if not type(self)._ENABLE_COMBINE_NO_STAGE1:
@@ -1655,6 +1713,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
             and input.dtype == torch.bfloat16
         )
         blockwise_fp8 = p2p_quant == "fp8_blockwise_1x32"
+        blockwise_i8 = p2p_quant == "int8_blockwise_1x32"
         c_dtype = torch.float8_e4m3fn if fp8_dc else input.dtype
         _cur_tok = self._resolve_cur_tok(cur_tok, "preload_combine_no_stage1()")
         block_num, warp_num = _resolve_launch_geometry(
@@ -1673,10 +1732,12 @@ class FlyDSLDispatchCombineIntraNodeOp:
             bool(enable_weights),
             bool(fp8_dc),
             bool(blockwise_fp8),
+            bool(blockwise_i8),
             block_num,
             warp_num,
             True,
             bool(mask_topk_ids),
+            None if post_route_norm_eps is None else float(post_route_norm_eps),
         )
         fn = self._comb_jit_cache.get(key)
         if fn is None:
@@ -1695,8 +1756,13 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 skip_stage1=True,
                 fp8_direct_cast=bool(fp8_dc),
                 blockwise_fp8_transport=bool(blockwise_fp8),
+                blockwise_i8_transport=bool(blockwise_i8),
                 max_recv=self._effective_max_recv,
                 mask_topk_ids=bool(mask_topk_ids),
+                post_route_norm=post_route_norm_eps is not None,
+                post_route_norm_eps=(
+                    1e-6 if post_route_norm_eps is None else float(post_route_norm_eps)
+                ),
             )
             self._comb_jit_cache[key] = fn
         fixed = (
@@ -1725,6 +1791,8 @@ class FlyDSLDispatchCombineIntraNodeOp:
             *tail,
             fx.Int64(0),
             *std,
+            fx.Int64(0),
+            fx.Int64(0),
             _cur_tok,
             torch.cuda.current_stream(),
         )

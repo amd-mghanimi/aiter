@@ -9,7 +9,7 @@ import mori.shmem as ms
 import torch
 
 from aiter import logger
-from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.jit.utils.chip_info import get_gfx_runtime, get_num_xcds
 from aiter.utility import dtypes
 
 from ..flydsl_dispatch_combine_intranode_op import (
@@ -22,8 +22,10 @@ from ..flydsl_dispatch_combine_intranode_op import (
 from ..tensor_shim import torch_stream
 from .dispatch import DISPATCH_TABLE_SIZE, DispatchSlot
 from .mega_moe_config import (
+    BLOCKWISE_P2P_QUANT_MODES,
     DEFAULT_SMALL_M_MTPRS,
     INDEXED_PAYLOAD_MIN_MTPR,
+    P2P_QUANT_I8_BLOCKWISE,
     ROUTE_LARGE_M,
     ROUTE_SMALL_M,
     ROUTE_STAGED,
@@ -48,6 +50,15 @@ from .weights import (
 __all__ = ["MegaMoEV2"]
 
 
+def _device_num_xcds(device) -> int | None:
+    """XCD count of ``device``, or None when the HIP runtime cannot report it."""
+    with torch.cuda.device(device):
+        try:
+            return get_num_xcds(default=None)
+        except (RuntimeError, OSError):
+            return None
+
+
 class MegaMoEV2:
     """Fused dispatch, GEMM1, GEMM2, and combine with one in-flight launch per instance."""
 
@@ -61,8 +72,14 @@ class MegaMoEV2:
         swiglu_limit: float = 0.0, fanout_masks: tuple[int, ...] = (),
         act: str = "silu", situ_beta: float = 1.0, situ_linear_beta: float = 1.0,
         large_m_state_slots: int = 1, large_m_enabled: bool | None = None,
-        small_m_mtprs: tuple[int, ...] | None = None, routed: bool = False):
+        small_m_mtprs: tuple[int, ...] | None = None, routed: bool = False,
+        post_route_norm: tuple[torch.Tensor, float] | None = None):
     # fmt: on
+        """``post_route_norm=(gain, eps)``: RMS-normalize each route's output
+        with the f32 ``[model_dim]`` gain before the router weight, so forward()
+        returns ``sum_k w_k * rms_norm(gain * y_k)`` (Muse Spark's post-expert
+        norm). Routes travel unweighted and combine applies norm and weight;
+        staged route only. ``post_route_norm_gain`` may be rebound per layer."""
         if quant not in ("a4w4", "a8w4"):
             raise ValueError("MegaMoEV2 quant must be 'a4w4' or 'a8w4'")
         if experts % world_size != 0:
@@ -107,6 +124,23 @@ class MegaMoEV2:
         # built and the plan picks one route per call (see MegaMoEBundlePlan.route_for). Without it the instance
         # holds the staged route only, the memory of a caller that never routes. small_m_mtprs and
         # large_m_enabled pin a route in or out either way.
+        self.post_route_norm_gain = None
+        self._post_route_norm_eps = None
+        self._norm_route_wts = None
+        if post_route_norm is not None:
+            if small_m_mtprs or large_m_enabled:
+                raise ValueError("post_route_norm supports the staged route only")
+            small_m_mtprs, large_m_enabled = (), False
+            gain, eps = post_route_norm
+            self.post_route_norm_gain = gain
+            self._post_route_norm_eps = float(eps)
+            self._unit_wts = torch.ones(
+                self.mtpr, self.topk, dtype=torch.float32, device=self.dev
+            )
+        if stage2_p2p_quant == P2P_QUANT_I8_BLOCKWISE:
+            if small_m_mtprs or large_m_enabled:
+                raise ValueError(f"{stage2_p2p_quant} supports the staged route only")
+            small_m_mtprs, large_m_enabled = (), False
         if small_m_mtprs is None:
             small_m_mtprs = DEFAULT_SMALL_M_MTPRS if routed else ()
         if large_m_enabled is None:
@@ -132,6 +166,7 @@ class MegaMoEV2:
             model_dim=self.model_dim,
             inter_dim=self.inter_dim,
             world_size=self.world_size,
+            num_xcds=_device_num_xcds(self.dev),
             small_m_mtprs=(
                 tuple(small_m_mtprs) if fused and small_m_cu_supported(num_cu) else ()
             ),
@@ -165,6 +200,13 @@ class MegaMoEV2:
             gm_indexed_payload=compact and self.mtpr >= INDEXED_PAYLOAD_MIN_MTPR,
             max_total_recv_tokens=self.world_size)
         # fmt: on
+        if post_route_norm is not None:
+            # The norm pass adds a latency-bound read of every route row; a
+            # one-block-per-CU grid hides it (2.5x faster than the default).
+            self.comb_cfg.combine_block_num = torch.cuda.get_device_properties(
+                self.dev
+            ).multi_processor_count
+            self.comb_cfg.combine_warp_num_per_block = 8
         self._build_route_arenas()
         self.comb_op = FlyDSLDispatchCombineIntraNodeOp(
             self.comb_cfg,
@@ -1180,6 +1222,7 @@ class MegaMoEV2:
             return runtime.forward(
                 x_bf16, wts, topk_ids, slice_output=slice_output
             )
+        wts = self._route_weights_for_dispatch(wts)
         run_tokens = check_forward_inputs(
             x_bf16, wts, topk_ids, max_rows=self.mtpr, model_dim=self.model_dim,
             topk=self.topk, device=self.dev,
@@ -1250,6 +1293,7 @@ class MegaMoEV2:
                 stream=stream,
                 slice_output=slice_output,
             )
+        wts = self._route_weights_for_dispatch(wts)
         launch_stream = torch_stream(stream)
         if stream is None:
             return self._run_joint(
@@ -1265,10 +1309,30 @@ class MegaMoEV2:
     forward_bf16 = forward
     __call__ = forward
 
+    def _route_weights_for_dispatch(self, wts):
+        """Under post_route_norm, keep the router weights for combine and send
+        the routes unit weights, so GEMM2 writes them unweighted."""
+        if self._post_route_norm_eps is None:
+            return wts
+        if wts.dtype != torch.float32 or not wts.is_contiguous():
+            raise ValueError("post_route_norm needs contiguous float32 router weights")
+        self._norm_route_wts = wts
+        return self._unit_wts[: wts.shape[0]]
+
+    def _combine_post_route_norm(self):
+        if self._post_route_norm_eps is None:
+            return None
+        gain = self.post_route_norm_gain
+        if gain.dtype != torch.float32 or not gain.is_contiguous():
+            raise ValueError("post_route_norm_gain must be contiguous float32")
+        return (self._norm_route_wts, gain, self._post_route_norm_eps)
+
     def _build_fused_stage2(self):
         from .mega_moe_stage2 import (
             preload_mega_moe_stage2,
+            preload_stage2_scale_forward,
             run_mega_moe_stage2,
+            run_stage2_scale_forward,
             stage2_p2p_row_nbytes,
         )
         from .mega_moe_stage2_aligned_pair import (
@@ -1287,11 +1351,20 @@ class MegaMoEV2:
         self._g2_preload = preload_mega_moe_stage2
         self._g2_pair_run = run_mega_moe_stage2_aligned_pair
         self._g2_pair_preload = preload_mega_moe_stage2_aligned_pair
+        self._g2_scale_fwd_run = run_stage2_scale_forward
+        self._g2_scale_fwd_preload = preload_stage2_scale_forward
+        # Stage2Config.scale_forward: per sorted row and 256-column n-block, its 8 E8M0 scale bytes.
+        self._g2_scale_fwd_rows = int(self._s1_op.srcmap_em.numel())
+        self._g2_scale_stage = None
+        if any(entry.config.stage2.scale_forward for entry in self._bundle_plan.entries):
+            self._g2_scale_stage = torch.empty(
+                (int(comb_cfg.hidden_dim) // 256) * self._g2_scale_fwd_rows * 8, dtype=torch.uint8, device=dev
+            )
         self._g2_residual_stream = torch.cuda.Stream(device=dev, priority=0)
         self._g2_residual_start = torch.cuda.Event()
         self._g2_residual_done = torch.cuda.Event()
         self._g2_invariants_by_quant = {}
-        for p2p_quant in ("none", "fp8_blockwise_1x32"):
+        for p2p_quant in ("none", "fp8_blockwise_1x32", P2P_QUANT_I8_BLOCKWISE):
             p2p_row_nbytes = stage2_p2p_row_nbytes(comb_cfg.hidden_dim, p2p_quant)
             self._g2_invariants_by_quant[p2p_quant] = {
                 "model_dim": int(comb_cfg.hidden_dim), "inter_dim": int(self.inter_dim),
@@ -1312,6 +1385,7 @@ class MegaMoEV2:
         op = self._s1_op
         workspace = self._s1_dispatch_workspace
         stage2 = config.stage2
+        scale_forward = self._uses_scale_forward(config, runtime_pair_skip)
         launcher(
             fx.Int64(self._s1_out.view(-1).data_ptr()),
             fx.Int64(self._s1_osd.data_ptr()),
@@ -1349,7 +1423,37 @@ class MegaMoEV2:
             g2_bf16_lds=stage2.bf16_lds,
             runtime_pair_skip=runtime_pair_skip,
             scatter_vec=scatter_vec,
+            scale_fwd_rows=self._g2_scale_fwd_rows if scale_forward else 0,
+            arg_scale_stage=self._g2_scale_stage.data_ptr() if scale_forward else 0,
+            skew_normal_strided=stage2.skew_normal_strided and stage2.skew_cu > 0,
             **self._g2_invariants_by_quant[config.p2p_quant],
+        )
+
+    @staticmethod
+    def _uses_scale_forward(config, runtime_pair_skip):
+        # The aligned-pair residual leaves the pair kernel's rows unstaged, so it stores its scales directly.
+        return (
+            config.stage2.scale_forward
+            and config.p2p_quant in BLOCKWISE_P2P_QUANT_MODES
+            and not runtime_pair_skip
+        )
+
+    def _scale_forward_call(self, launcher, config, stream):
+        """Send the row scales a Stage2Config.scale_forward launch staged."""
+        inv = self._g2_invariants_by_quant[config.p2p_quant]
+        return launcher(
+            self._s1_op.num_valid.data_ptr(),
+            self._s1_op.srcmap_em.data_ptr(),
+            self._s1_op.tile_row_base.data_ptr(),
+            self._g2_scale_stage.data_ptr(),
+            self.comb_op._fx_p2p_comb_inp,
+            stream,
+            model_dim=int(inv["model_dim"]), topk=int(inv["topk"]), npes=int(inv["npes"]),
+            max_tok=int(inv["max_tok"]), recv_cap=int(inv["recv_cap"]),
+            comb_inp_nbytes=int(inv["comb_inp_nbytes"]), p2p_quant_type=config.p2p_quant,
+            BN=config.stage2.block_n, SBM=config.stage1.sort_block_m, scale_fwd_rows=self._g2_scale_fwd_rows,
+            max_rows=-(-int(self._s1_nvm) // config.stage1.sort_block_m)
+            * config.stage1.sort_block_m,
         )
 
     def _preload_fused_stage2(
@@ -1367,6 +1471,8 @@ class MegaMoEV2:
             runtime_pair_skip=runtime_pair_skip,
             scatter_vec=scatter_vec,
         )
+        if self._uses_scale_forward(config, runtime_pair_skip):
+            self._scale_forward_call(self._g2_scale_fwd_preload, config, stream)
 
     def _aligned_pair_stage2_call(self, launcher, config: MegaMoEConfig, stream):
         """Invoke the aligned-pair Stage2 kernel through its shared ABI."""
@@ -1448,6 +1554,7 @@ class MegaMoEV2:
                     enable_weights=False,
                     stage2_p2p_quant=entry.config.p2p_quant,
                     mask_topk_ids=mask_topk_ids,
+                    post_route_norm_eps=self._post_route_norm_eps,
                 )
 
     def _run_fused_stage2(
@@ -1474,12 +1581,15 @@ class MegaMoEV2:
             runtime_pair_skip=bool(runtime_pair_skip),
             scatter_vec=int(scatter_vec),
         )
+        if self._uses_scale_forward(config, runtime_pair_skip):
+            self._scale_forward_call(self._g2_scale_fwd_run, config, s_fx)
         self._g2_active_block_m = stage2.block_m
         if not combine:
             return None
         return comb_op.combine_no_stage1(
             self._g2_combine_placeholder, None, combine_ids, cur_tok=run_tokens,
             enable_weights=False, stage2_p2p_quant=p2p_quant,
+            post_route_norm=self._combine_post_route_norm(),
         )
 
     def _launch_aligned_pair_stage2(self, config: MegaMoEConfig, stream):
@@ -1529,5 +1639,6 @@ class MegaMoEV2:
             cur_tok=run_tokens,
             enable_weights=False,
             stage2_p2p_quant=config.p2p_quant,
+            post_route_norm=self._combine_post_route_norm(),
         )
         return self._stage2_output(result, run_tokens, slice_output)
