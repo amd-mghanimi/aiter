@@ -186,6 +186,24 @@ class Stage1Config:
     # ready m-tile (the n-tile set sharded order and static GEMM1 give it), keeping the
     # experts' W1 slabs in its L2 instead of all 16 n-tiles of every expert in flight.
     ready_xcd: bool = False
+    # Payload producer rows per wave step, every load of the step (route ids, tokens,
+    # scales, and the route headers: weights, plus a fanout-pair row's member expert
+    # bases) issued before its remote stores (0 = two rows, loads per row).  Loads and
+    # stores share the in-order vmcnt, so a dependent load otherwise waits out the
+    # previous rows' XGMI stores: a pair row's ~6 such waits held its producer CTA to
+    # ~2 rows/us, and a hot destination's 1536-row pair chunks finished hundreds of us
+    # after the other tasks.  Rank-local: chunks and tile publish counts are unchanged.
+    payload_batch_rows: int = 0
+    # Compact GEMM tile claims acquire the tile's payload once, on the thread that waited
+    # for it (before the CTA barrier), instead of a system-scope acquire on every thread
+    # after it.  That one buffer_inv already covers the CU's L1 and the XCD's L2 lines all
+    # the CTA's waves read through; repeating it on 8 waves cost ~4-6 us a tile in the traces.
+    acquire_once: bool = False
+    # Payload producers queue the tiles a chunk completes in consecutive arrival slots
+    # (one tail reservation per chunk) instead of one slot per tile interleaved with
+    # every other producer's tiles, so an XCD's in-flight tiles more often share W1
+    # slabs.  Queue protocol, chunks and publish counts are unchanged.
+    ready_runs: bool = False
 
 
 def stage1_bundle_identity(config: Stage1Config) -> Stage1Config:
@@ -1200,7 +1218,11 @@ def _tune_muse_spark(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfi
     on the route-major payload only, so they stay off from INDEXED_PAYLOAD_MIN_MTPR.
     Pooled payload producers spread a hot destination (all of a rank's rows under
     expert-local routes) over every producer CTA instead of its 4, and per-XCD
-    arrival-order counters keep each XCD on 2 of the 16 W1 n-slabs.
+    arrival-order counters keep each XCD on 2 of the 16 W1 n-slabs.  Producers batch
+    4 rows per wave step with all loads ahead of the stores (payload_batch_rows), so the
+    fanout-pair chunks no longer finish hundreds of us after the other payload tasks,
+    a tile claim acquires its payload once on the waiting thread (acquire_once), and a
+    chunk's completed tiles take consecutive arrival slots (ready_runs).
     Stage2 is bound by its remote stores, a third of that by the 16 n-blocks' partial writes into each row's
     one E8M0 scale line, so it stages the scales and sends each line whole (scale_forward); unskewed routes
     keep strided m-blocks under skew_cu (skew_normal_strided).
@@ -1212,7 +1234,8 @@ def _tune_muse_spark(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfi
         config,
         stage1={
             "sort_block_m": 128, "waves_per_eu_hint": 1, "ascale_packed": route_major, "epi_fp4_v8": route_major,
-            "pooled_dispatch": True, "ready_xcd": True,
+            "pooled_dispatch": True, "ready_xcd": True, "payload_batch_rows": 4, "acquire_once": True,
+            "ready_runs": True,
         },
         stage2={"block_m": 64, "b2stage": True, "deep_a_pipeline": True, "scale_forward": True,
                 "skew_normal_strided": True},

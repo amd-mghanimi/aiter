@@ -375,6 +375,9 @@ _LATER_STAGE_KNOBS = (
     "pooled_dispatch",
     "ready_order",
     "ready_xcd",
+    "payload_batch_rows",
+    "acquire_once",
+    "ready_runs",
     "scale_forward",
     "skew_normal_strided",
 )

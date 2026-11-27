@@ -395,7 +395,14 @@ def _publish_tile_range(
     parity,
     *,
     tile_state_stride,
+    ready_runs=False,
 ):
+    """Count a chunk's rows into its tiles and queue the tiles it completes.
+
+    ``ready_runs``: the completed tiles take consecutive arrival-queue slots from
+    one tail reservation (at most 64 tiles per chunk), so an expert's tiles are
+    not interleaved with other publishers' tiles one slot at a time.
+    """
     if row_end > row_begin:
         comm_ops.fence_system_release()
         remote_tile_ready = ptr_buf_tensor(p_tile_ready, fx.Int64)[destination]
@@ -411,24 +418,52 @@ def _publish_tile_range(
         remote_queue_tail = remote_queue_tail + fx.Int64(parity) * 4
         first_tile = (destination_base + row_begin) // rows_per_tile
         last_tile = (destination_base + row_end - fx.Int32(1)) // rows_per_tile
-        for tile in range(first_tile, last_tile + fx.Int32(1), 1):
-            previous = fx.Int32(
-                comm_ops.atomic_add_system(
-                    remote_tile_ready + fx.Int64(tile) * 4, fx.Int32(1)
+        if const_expr(ready_runs):
+            completed = fx.Int64(0)
+            for tile in range(first_tile, last_tile + fx.Int32(1), 1):
+                previous = fx.Int32(
+                    comm_ops.atomic_add_system(
+                        remote_tile_ready + fx.Int64(tile) * 4, fx.Int32(1)
+                    )
                 )
-            )
-            expected = ptr_buf_tensor(remote_tile_expected, fx.Int32)[tile]
-            if previous + 1 == expected:
-                # The final RMW observes the release sequence from all payload
-                # publishers before publishing the completion-order entry.
+                expected = ptr_buf_tensor(remote_tile_expected, fx.Int32)[tile]
+                bit = (previous + 1 == expected).select(fx.Int64(1), fx.Int64(0))
+                completed = completed | (bit << fx.Int64(tile - first_tile))
+            count = fx.Int32(fx.Int64(fx.math.ctpop(completed)))
+            if count > fx.Int32(0):
                 comm_ops.fence_system_acquire()
                 ready_slot = fx.Int32(
-                    comm_ops.atomic_add_system(remote_queue_tail, fx.Int32(1))
+                    comm_ops.atomic_add_system(remote_queue_tail, count)
                 )
-                ptr_buf_tensor(remote_queue, fx.Int32)[ready_slot] = tile
+                for tile in range(first_tile, last_tile + fx.Int32(1), 1):
+                    offset = fx.Int64(tile - first_tile)
+                    if (completed >> offset) & fx.Int64(1) != fx.Int64(0):
+                        below = completed & ((fx.Int64(1) << offset) - fx.Int64(1))
+                        slot = ready_slot + fx.Int32(fx.Int64(fx.math.ctpop(below)))
+                        ptr_buf_tensor(remote_queue, fx.Int32)[slot] = tile
                 fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
                 comm_ops.fence_system_release()
-                comm_ops.store_i32_system(remote_queue_epoch, ready_slot, payload_epoch)
+                for slot in range(ready_slot, ready_slot + count, 1):
+                    comm_ops.store_i32_system(remote_queue_epoch, slot, payload_epoch)
+        else:
+            for tile in range(first_tile, last_tile + fx.Int32(1), 1):
+                previous = fx.Int32(
+                    comm_ops.atomic_add_system(
+                        remote_tile_ready + fx.Int64(tile) * 4, fx.Int32(1)
+                    )
+                )
+                expected = ptr_buf_tensor(remote_tile_expected, fx.Int32)[tile]
+                if previous + 1 == expected:
+                    # The final RMW observes the release sequence from all payload
+                    # publishers before publishing the completion-order entry.
+                    comm_ops.fence_system_acquire()
+                    ready_slot = fx.Int32(
+                        comm_ops.atomic_add_system(remote_queue_tail, fx.Int32(1))
+                    )
+                    ptr_buf_tensor(remote_queue, fx.Int32)[ready_slot] = tile
+                    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+                    comm_ops.fence_system_release()
+                    comm_ops.store_i32_system(remote_queue_epoch, ready_slot, payload_epoch)
 
 
 # fmt: off
@@ -1578,12 +1613,16 @@ def emit_dispatch_payload(
     indexed_payload=False,
     pooled=False,
     pool_scratch=None,
+    batch_rows=0,
+    ready_runs=False,
 ):
 # fmt: on
     """Produce independently publishable expert payloads from a compact plan.
 
     ``pooled``: producers draw tasks of every destination from one counter
     (``pool_scratch``: an LDS int32 to broadcast the task index).
+    ``batch_rows``: rows per wave step with all their loads ahead of the stores (0: two rows, loads per row).
+    ``ready_runs``: see ``_publish_tile_range``.
     """
     full_units = fz_n_i32 // 4 // 64
     total_units = (fz_n_i32 // 4 + 63) // 64
@@ -1736,7 +1775,7 @@ def emit_dispatch_payload(
                     scale_table[destination], fx.Int32, unit_elems=4
                 )
 
-        def _row_body(row, wk, token_vals):
+        def _row_body(row, wk, token_vals, headers_pre=None, scale_pre=None):
             source_token = wk // fx.Int32(fz_k)
             topk_slot = wk % fx.Int32(fz_k)
             group_member_slots = (wk >> fx.Int32(24)) & fx.Int32(0xFF)
@@ -1747,8 +1786,9 @@ def emit_dispatch_payload(
             destination_row = destination_base + row
             source_key = fx.Int32(fz_rank * fz_mtpr) + source_token
 
-            def _copy_route_header(route_index, route_row):
-                weight = weight_buffer[route_index]
+            def _copy_route_header(route_index, route_row, weight=None):
+                if const_expr(weight is None):
+                    weight = weight_buffer[route_index]
                 route_slot = route_index % fx.Int32(fz_k)
                 source_encoding = source_key | (route_slot << fx.Int32(24))
                 weight_bits = fx.Float32(weight).bitcast(fx.Int32)
@@ -1764,36 +1804,41 @@ def emit_dispatch_payload(
                     )
 
             if lane == fx.Int32(0):
-                if group_task:
-                    if const_expr(fz_k <= 8):
-                        for slot in range_constexpr(fz_k):
-                            member_active = (
-                                group_member_slots >> fx.Int32(slot)
-                            ) & fx.Int32(1)
-                            if member_active != fx.Int32(0):
+                if const_expr(headers_pre is not None):
+                    for active, route, route_row, weight in headers_pre:
+                        if active:
+                            _copy_route_header(route, route_row, weight)
+                else:
+                    if group_task:
+                        if const_expr(fz_k <= 8):
+                            for slot in range_constexpr(fz_k):
+                                member_active = (
+                                    group_member_slots >> fx.Int32(slot)
+                                ) & fx.Int32(1)
+                                if member_active != fx.Int32(0):
+                                    member_route = (
+                                        source_token * fx.Int32(fz_k)
+                                        + fx.Int32(slot)
+                                    )
+                                    member_ge = idx_buffer[member_route]
+                                    member_base = group_base[member_ge]
+                                    _copy_route_header(
+                                        member_route, member_base + row
+                                    )
+                        else:
+                            slot_a = group_member_slots & fx.Int32(0xF)
+                            slot_b = (group_member_slots >> fx.Int32(4)) & fx.Int32(
+                                0xF
+                            )
+                            for member_slot in (slot_a, slot_b):
                                 member_route = (
-                                    source_token * fx.Int32(fz_k)
-                                    + fx.Int32(slot)
+                                    source_token * fx.Int32(fz_k) + member_slot
                                 )
                                 member_ge = idx_buffer[member_route]
                                 member_base = group_base[member_ge]
-                                _copy_route_header(
-                                    member_route, member_base + row
-                                )
+                                _copy_route_header(member_route, member_base + row)
                     else:
-                        slot_a = group_member_slots & fx.Int32(0xF)
-                        slot_b = (group_member_slots >> fx.Int32(4)) & fx.Int32(
-                            0xF
-                        )
-                        for member_slot in (slot_a, slot_b):
-                            member_route = (
-                                source_token * fx.Int32(fz_k) + member_slot
-                            )
-                            member_ge = idx_buffer[member_route]
-                            member_base = group_base[member_ge]
-                            _copy_route_header(member_route, member_base + row)
-                else:
-                    _copy_route_header(wk, destination_row)
+                        _copy_route_header(wk, destination_row)
 
             payload_row = destination_row
             if const_expr(indexed_payload):
@@ -1803,15 +1848,18 @@ def emit_dispatch_payload(
                 if const_expr(fz_scale_n_i32 % 4 == 0):
                     scale_offset = scale_lane * fx.Int32(4)
                     if scale_offset < fx.Int32(fz_scale_n_i32):
-                        scale_unit = (
-                            source_token * fx.Int32(fz_scale_n_i32) + scale_offset
-                        ) // fx.Int32(4)
-                        scale = buf_copy_load(
-                            source_scale_vec_buffer,
-                            scale_unit,
-                            fx.Int32,
-                            unit_elems=4,
-                        )
+                        if const_expr(scale_pre is None):
+                            scale_unit = (
+                                source_token * fx.Int32(fz_scale_n_i32) + scale_offset
+                            ) // fx.Int32(4)
+                            scale = buf_copy_load(
+                                source_scale_vec_buffer,
+                                scale_unit,
+                                fx.Int32,
+                                unit_elems=4,
+                            )
+                        else:
+                            scale = scale_pre
                         if const_expr(hoist_remote_resources):
                             buf_copy_store(
                                 remote_scale_vec_buffer,
@@ -1894,24 +1942,79 @@ def emit_dispatch_payload(
                     if unit < fx.Int32(fz_n_i32 // 4):
                         buf_copy_store(destination_buffer, unit, vals[j], fx.Int32, unit_elems=4)
 
-        # Two rows per step: both route ids are read back to back and both
-        # rows' loads are in flight before either is stored, instead of one
-        # dependent id read plus ~4 load round trips per row.
-        for row in range(row_begin + row0, row_end, row_stride * 2):
-            row_b = row + row_stride
-            has_b = row_b < row_end
-            wk_a_lane = fx.Int32(0)
-            wk_b_lane = fx.Int32(0)
-            if lane == fx.Int32(0):
-                wk_a_lane = pair_order[source_base + row]
-                wk_b_lane = pair_order[source_base + has_b.select(row_b, row)]
-            wk_a = fx.Int32(fx.rocdl.readfirstlane(T.i32, wk_a_lane))
-            wk_b = fx.Int32(fx.rocdl.readfirstlane(T.i32, wk_b_lane))
-            vals_a = _load_token(wk_a)
-            vals_b = _load_token(wk_b)
-            _row_body(row, wk_a, vals_a)
-            if has_b:
-                _row_body(row_b, wk_b, vals_b)
+        def _load_row_pre(wk, row):
+            # Header (route, header row, weight) of each route a row carries: the row's
+            # own route, or a fanout-pair row's member slots (bits 24..31 of wk, at
+            # most two set), with their expert's group base loaded here too.
+            source_token = group_task.select(wk & fx.Int32(0xFFFFFF), wk // fx.Int32(fz_k))
+            member_slots = group_task.select((wk >> fx.Int32(24)) & fx.Int32(0xFF), fx.Int32(0))
+            rest = member_slots & (member_slots - fx.Int32(1))
+            headers = []
+            for slots, active in (
+                (member_slots, (member_slots != fx.Int32(0)) | (local_segment != fx.Int32(fz_epr))),
+                (rest, rest != fx.Int32(0)),
+            ):
+                lowest = slots & (fx.Int32(0) - slots)
+                slot = fx.Int32(fx.math.ctpop(lowest - fx.Int32(1)))
+                slot = (slots != fx.Int32(0)).select(slot, fx.Int32(0))
+                route = group_task.select(source_token * fx.Int32(fz_k) + slot, wk)
+                headers.append([active, route, weight_buffer[route], idx_buffer[route]])
+            for header in headers:
+                member_row = group_base[header[3]] + row
+                header[3] = group_task.select(member_row, destination_base + row)
+            headers = [(active, route, route_row, weight) for active, route, weight, route_row in headers]
+            scale = None
+            if const_expr(fz_enable_scales and fz_scale_n_i32 % 4 == 0):
+                scale_offset = lane * fx.Int32(4)
+                scale_offset = (scale_offset < fx.Int32(fz_scale_n_i32)).select(
+                    scale_offset, fx.Int32(0)
+                )
+                scale = buf_copy_load(
+                    source_scale_vec_buffer,
+                    (source_token * fx.Int32(fz_scale_n_i32) + scale_offset) // fx.Int32(4),
+                    fx.Int32,
+                    unit_elems=4,
+                )
+            return headers, scale
+
+        if const_expr(batch_rows > 0):
+            # batch_rows rows per step, every load (route id, token, weight,
+            # scale) issued before any store: VMEM loads and stores share one
+            # in-order vmcnt, so a dependent load after a row's remote stores
+            # waits out their XGMI round trip, once per step instead of twice
+            # per row.
+            assert hoist_remote_resources and fz_k <= 8
+            for row in range(row_begin + row0, row_end, row_stride * batch_rows):
+                step_rows, wks = [], []
+                for j in range_constexpr(batch_rows):
+                    row_j = row + row_stride * fx.Int32(j)
+                    step_rows.append(row_j)
+                    row_j = (row_j < row_end).select(row_j, row)
+                    wks.append(fx.Int32(fx.rocdl.readfirstlane(T.i32, pair_order[source_base + row_j])))
+                vals = [_load_token(wk) for wk in wks]
+                pres = [_load_row_pre(wk, row_j) for wk, row_j in zip(wks, step_rows)]
+                for j in range_constexpr(batch_rows):
+                    if step_rows[j] < row_end:
+                        _row_body(step_rows[j], wks[j], vals[j], pres[j][0], pres[j][1])
+        else:
+            # Two rows per step: both route ids are read back to back and both
+            # rows' loads are in flight before either is stored, instead of one
+            # dependent id read plus ~4 load round trips per row.
+            for row in range(row_begin + row0, row_end, row_stride * 2):
+                row_b = row + row_stride
+                has_b = row_b < row_end
+                wk_a_lane = fx.Int32(0)
+                wk_b_lane = fx.Int32(0)
+                if lane == fx.Int32(0):
+                    wk_a_lane = pair_order[source_base + row]
+                    wk_b_lane = pair_order[source_base + has_b.select(row_b, row)]
+                wk_a = fx.Int32(fx.rocdl.readfirstlane(T.i32, wk_a_lane))
+                wk_b = fx.Int32(fx.rocdl.readfirstlane(T.i32, wk_b_lane))
+                vals_a = _load_token(wk_a)
+                vals_b = _load_token(wk_b)
+                _row_body(row, wk_a, vals_a)
+                if has_b:
+                    _row_body(row_b, wk_b, vals_b)
 
         if chunk_active:
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
@@ -1940,6 +2043,7 @@ def emit_dispatch_payload(
                                     payload_epoch,
                                     parity,
                                     tile_state_stride=tile_state_stride,
+                                    ready_runs=ready_runs,
                                 )
                     elif pair_enabled:
                         for member in (pair_a, pair_b):
@@ -1959,6 +2063,7 @@ def emit_dispatch_payload(
                                 payload_epoch,
                                 parity,
                                 tile_state_stride=tile_state_stride,
+                                ready_runs=ready_runs,
                             )
                 else:
                     _publish_tile_range(
@@ -1975,6 +2080,7 @@ def emit_dispatch_payload(
                         payload_epoch,
                         parity,
                         tile_state_stride=tile_state_stride,
+                        ready_runs=ready_runs,
                     )
                 _finish_task(chunk_done, segment, num_chunks)
             fx.barrier()

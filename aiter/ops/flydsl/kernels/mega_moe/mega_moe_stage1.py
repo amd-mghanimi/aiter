@@ -128,6 +128,8 @@ def compile_mega_moe_stage1(
     act: str = "silu", situ_beta: float = 1.0, situ_linear_beta: float = 1.0,
     ascale_packed: bool = False, epi_fp4_v8: bool = False,
     pooled_dispatch: bool = False, ready_order: int = -1, ready_xcd: bool = False,
+    payload_batch_rows: int = 0, acquire_once: bool = False,
+    ready_runs: bool = False,
     _return_kernel_spec: bool = False,
 ):
     arch = str(get_rocm_arch() or "")
@@ -276,6 +278,11 @@ def compile_mega_moe_stage1(
     WORK_BATCH = 1
     POOLED = bool(pooled_dispatch) and compact_dispatch
     READY_XCD = bool(ready_xcd) and compact_dispatch
+    BATCH_ROWS = int(payload_batch_rows) if compact_dispatch else 0
+    ACQUIRE_ONCE = bool(acquire_once) and compact_dispatch
+    READY_RUNS = bool(ready_runs) and compact_dispatch
+    assert not READY_RUNS or payload_chunk_rows // sort_block_m + 1 <= 64
+    assert 0 <= BATCH_ROWS <= 8
     if READY_XCD:
         assert WORK_BATCH == 1 and N_TILES % 8 == 0
 
@@ -304,6 +311,9 @@ def compile_mega_moe_stage1(
         f"{'_pool' if POOLED else ''}"
         f"{'' if ready_order < 0 else f'_ro{int(ready_order)}'}"
         f"{'_rx' if READY_XCD else ''}"
+        f"{f'_pb{BATCH_ROWS}' if BATCH_ROWS else ''}"
+        f"{'_aq1' if ACQUIRE_ONCE else ''}"
+        f"{'_rr' if READY_RUNS else ''}"
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[TOTAL_THREADS, 1, 1])
@@ -497,6 +507,8 @@ def compile_mega_moe_stage1(
                     indexed_payload=indexed_payload,
                     pooled=POOLED,
                     pool_scratch=fx.recast_iter(fx.Int32, lds.bc_work.ptr),
+                    batch_rows=BATCH_ROWS,
+                    ready_runs=READY_RUNS,
                 )
         if const_expr(fixed_slot_dispatch):
             if is_owner:
@@ -640,8 +652,11 @@ def compile_mega_moe_stage1(
                         # Ready-order waits for the tile in the scheduler block.
                         if tid == fx.Int32(0):
                             _wait_tile_payload(work)
+                            if const_expr(ACQUIRE_ONCE):
+                                comm_ops.fence_system_acquire()
                         fx.barrier()
-                        comm_ops.fence_system_acquire()
+                        if const_expr(not ACQUIRE_ONCE):
+                            comm_ops.fence_system_acquire()
                     _do_scheduled_tile(work)
 
         while consumer_active:
@@ -732,7 +747,9 @@ def compile_mega_moe_stage1(
                         )
                     fx.barrier()
             scheduled_first = Vec(sched_scratch_view.load())[0]
-            if const_expr(compact_dispatch):  # noqa: SIM102 - preserve DSL staging
+            # acquire_once: the waiting thread's acquire above already invalidated the
+            # CU's L1 and the XCD's L2 lines every wave of this CTA reads through.
+            if const_expr(compact_dispatch and not ACQUIRE_ONCE):  # noqa: SIM102 - preserve DSL staging
                 if use_ready_order:
                     comm_ops.fence_system_acquire()
             _run_work_batch(first_work, scheduled_first)
@@ -837,6 +854,9 @@ def compile_mega_moe_stage1_bundle(
             pooled_dispatch=config.pooled_dispatch,
             ready_order=config.ready_order,
             ready_xcd=config.ready_xcd,
+            payload_batch_rows=config.payload_batch_rows,
+            acquire_once=config.acquire_once,
+            ready_runs=config.ready_runs,
             _return_kernel_spec=True,
         )
         for config in variants
