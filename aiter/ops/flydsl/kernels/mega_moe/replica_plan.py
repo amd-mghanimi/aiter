@@ -60,7 +60,7 @@ def _count_kernel(ids_ptr, n, hist_ptr, li_ptr, base_ptr, E: tl.constexpr, BLOCK
 
 @triton.jit
 def _place_kernel(
-    hist_ptr, mat_ptr, peers_ptr, epoch_ptr, held_ptr, rank, gate_pct,
+    hist_ptr, mat_ptr, peers_ptr, epoch_ptr, held_ptr, rank, gate_pct, refresh_pct,
     acs_ptr, e2s_ptr, info_ptr, scratch_ptr, ecount_out_ptr,
     R: tl.constexpr, E: tl.constexpr, B: tl.constexpr, EPN: tl.constexpr, P2P: tl.constexpr,
     ECOUNT_OUT: tl.constexpr,
@@ -140,6 +140,13 @@ def _place_kernel(
     ra = tl.load(scratch_ptr + e[None, :] * R + r[:, None], mask=(~single)[None, :], other=0)
     alloc = tl.where(single[None, :], tl.where(is_owner, ecount[None, :], 0), ra)
     tl.store(acs_ptr + e[None, :] * R + r[:, None], tl.cumsum(alloc, axis=0))
+    # Slot refresh flag for select: the held slots left this batch's busiest rank
+    # above refresh_pct% of the mean.
+    lmax = tl.max(tl.sum(alloc, axis=1), axis=0)
+    miss = (lmax * 100 * R > tl.sum(ecount, axis=0) * refresh_pct).to(tl.int32)
+    tl.store(info_ptr + 3 * E, miss)
+    if ECOUNT_OUT:
+        tl.store(ecount_out_ptr + E, miss)
     e2s = tl.where(is_owner, e[None, :] - r[:, None] * EPN, tl.where(rep, EPN + slot_of, -1))
     tl.store(e2s_ptr + r[:, None] * E + e[None, :], e2s)
 
@@ -173,18 +180,28 @@ def _rewrite_kernel(
 
 @triton.jit
 def _select_kernel(
-    ecount_ptr, held_ptr, placed_ptr,
+    ecount_ptr, held_ptr, placed_ptr, hyst, flag_ptr,
     R: tl.constexpr, E: tl.constexpr, B: tl.constexpr, EPN: tl.constexpr,
 ):
     """Greedy slot choice on the gathered histogram: R*B times, the busiest rank's
     largest per-copy share gets one more copy on the least-loaded rank with a free
     slot (loads tracked with an equal split between copies). Sticky: a slot whose
     expert stays wanted keeps it; new experts take the other slots in order.
-    Writes ``held`` (after) and ``placed`` (slots to fill, -1 = keep)."""
+    ``hyst`` (fraction) damps churn: shares of held experts count (1 + hyst) times,
+    and a held expert's new copy goes to a rank already holding it when one is free.
+    Writes ``held`` (after) and ``placed`` (slots to fill, -1 = keep); both stay
+    unchanged / all -1 when ``flag`` (place's refresh flag) is 0."""
     r = tl.arange(0, R)
     e = tl.arange(0, E)
     s = tl.arange(0, B)
     ecount = tl.load(ecount_ptr + e).to(tl.float32)
+    held0 = tl.load(held_ptr + r[:, None] * B + s[None, :])
+    # holder[r, e]: rank r holds e in a slot now
+    holder = tl.zeros([R, E], tl.int32)
+    for t in tl.static_range(B):
+        h_t = tl.load(held_ptr + r * B + t)
+        holder = holder | (h_t[:, None] == e[None, :]).to(tl.int32)
+    bonus = tl.where(tl.sum(holder, axis=0) > 0, 1.0 + hyst, 1.0)
     hosts = (e[None, :] // EPN) == r[:, None]
     ncop = tl.full([E], 1.0, tl.float32)
     load = tl.sum(tl.where(hosts, ecount[None, :], 0.0), axis=1)
@@ -196,13 +213,16 @@ def _select_kernel(
         on_h = tl.sum(tl.where((r[:, None] == h) & hosts, 1, 0), axis=0) > 0
         cand = tl.sum(tl.where(free[:, None] & (~hosts), 1, 0), axis=0) > 0
         share = ecount / ncop
-        sc = tl.where(on_h & cand, share, -1.0)
-        best = tl.max(sc, axis=0)
+        sc = tl.where(on_h & cand, share * bonus, -1.0)
         be = tl.argmax(sc, axis=0)
-        active = best > 0.0
+        active = tl.max(sc, axis=0) > 0.0
         col = e == be
+        best = tl.sum(tl.where(col, share, 0.0), axis=0)
         hb = tl.sum(tl.where(col[None, :] & hosts, 1, 0), axis=1) > 0
-        d = tl.argmin(tl.where(free & (~hb), load, float("inf")), axis=0)
+        ok = free & (~hb)
+        had = ok & (tl.sum(tl.where(col[None, :], holder, 0), axis=1) > 0)
+        pick = tl.where(tl.sum(had.to(tl.int32), axis=0) > 0, had, ok)
+        d = tl.argmin(tl.where(pick, load, float("inf")), axis=0)
         nb = tl.sum(tl.where(col, ecount, 0.0), axis=0) / (tl.sum(tl.where(col, ncop, 0.0), axis=0) + 1.0)
         load = tl.where(active, load + tl.where(hb, nb - best, 0.0) + tl.where(r == d, nb, 0.0), load)
         hosts = hosts | (col[None, :] & (r[:, None] == d) & active)
@@ -210,7 +230,7 @@ def _select_kernel(
         nd = tl.sum(tl.where(r == d, nwant, 0), axis=0)
         want = tl.where((r[:, None] == d) & (s[None, :] == nd) & active, be, want)
         nwant = tl.where((r == d) & active, nwant + 1, nwant)
-    held = tl.load(held_ptr + r[:, None] * B + s[None, :])
+    held = held0
     # keep[r, t]: slot t's expert is still wanted; new[r, s]: want[r, s] is not held
     keep = tl.sum(((want[:, :, None] == held[:, None, :]) & (held[:, None, :] >= 0)).to(tl.int32), axis=1) > 0
     new = (want >= 0) & (tl.sum((want[:, :, None] == held[:, None, :]).to(tl.int32), axis=2) == 0)
@@ -218,8 +238,9 @@ def _select_kernel(
     new_rank = tl.cumsum(new.to(tl.int32), axis=1) - 1
     hit = new[:, :, None] & (new_rank[:, :, None] == free_rank[:, None, :]) & (~keep)[:, None, :]
     placed = tl.max(tl.where(hit, want[:, :, None], -1), axis=1)
-    tl.store(held_ptr + r[:, None] * B + s[None, :], tl.where(keep, held, placed))
-    tl.store(placed_ptr + r[:, None] * B + s[None, :], placed)
+    go = tl.load(flag_ptr) != 0
+    tl.store(held_ptr + r[:, None] * B + s[None, :], tl.where(keep | (~go), held, placed))
+    tl.store(placed_ptr + r[:, None] * B + s[None, :], tl.where(go, placed, -1))
 
 
 class ReplicaPlanner:
@@ -235,12 +256,17 @@ class ReplicaPlanner:
     place kernel (mori shmem must be initialized, every rank constructs the planner in the
     same order); ``"allgather"`` uses ``torch.distributed`` on ``group``.
     ``gate_pct``: batches whose busiest rank is within this percentage of the mean keep
-    every route at home. ``interleave``: see ``_rewrite_kernel``.
+    every route at home. ``interleave``: see ``_rewrite_kernel``. ``select_hyst``: churn
+    damping of ``select`` (see ``_select_kernel``; 0 = none). ``refresh_pct``: ``select``
+    changes the slots only after a batch whose planned busiest rank (with the held slots)
+    exceeded this percentage of the mean (0 = every batch); a miss-driven refresh keeps
+    the weight pulls rare once the slots fit the running prompt.
     """
 
     def __init__(self, *, rank: int, world_size: int, experts: int, slots: int,
                  max_routes: int, device: torch.device, group=None, exchange: str = "p2p",
-                 gate_pct: int = 110, interleave: bool = True):
+                 gate_pct: int = 110, interleave: bool = True, select_hyst: float = 0.0,
+                 refresh_pct: int = 0):
         if experts % world_size:
             raise ValueError("experts must divide evenly over the ranks")
         if slots not in (1, 2, 4, 8):
@@ -255,12 +281,14 @@ class ReplicaPlanner:
         self.virtual_experts = world_size * self.vs
         self.group, self.exchange_mode = group, exchange
         self.gate_pct, self.interleave = int(gate_pct), bool(interleave)
+        self.select_hyst = float(select_hyst)
+        self.refresh_pct = int(refresh_pct)
         R, E = world_size, experts
         i32 = lambda *n: torch.zeros(*n, dtype=torch.int32, device=device)
         self.hist = i32(E)
         self.local_index = i32(max_routes)
         self.block_base = i32(triton.cdiv(max_routes, _CBLOCK) * E)
-        self.info = i32(3 * E)
+        self.info = i32(3 * E + 1)
         self.alloc_cumsum = i32(E * R)
         self.expert_to_slot = i32(R * E)
         self.scratch = i32(E * R)
@@ -295,8 +323,9 @@ class ReplicaPlanner:
             E=self.experts, BLOCK=_CBLOCK, num_warps=8)
 
     def place(self, held: torch.Tensor, ecount_out: torch.Tensor | None = None) -> None:
-        """``ecount_out``: optional int32 ``[experts]`` that also receives the expert
-        totals (for a later ``select`` after other layers have planned)."""
+        """``ecount_out``: optional int32 ``[experts + 1]`` that also receives the expert
+        totals and the refresh flag (for a later ``select`` after other layers have
+        planned)."""
         p2p = self.exchange_mode == "p2p"
         if self.exchange_mode == "allgather":
             import torch.distributed as dist
@@ -304,6 +333,7 @@ class ReplicaPlanner:
             dist.all_gather_into_tensor(self.mat, self.hist, group=self.group)
         _place_kernel[(1,)](
             self.hist, self.mat, self.peers, self.epoch, held, self.rank, self.gate_pct,
+            self.refresh_pct,
             self.alloc_cumsum, self.expert_to_slot, self.info, self.scratch,
             self.info if ecount_out is None else ecount_out,
             R=self.world_size, E=self.experts, B=self.slots, EPN=self.epn, P2P=p2p,
@@ -327,10 +357,13 @@ class ReplicaPlanner:
 
     def select(self, held: torch.Tensor, placed: torch.Tensor,
                ecount: torch.Tensor | None = None) -> None:
-        """Next forward's slots from expert totals ``ecount`` (default: those of the
-        last ``place``, ``info[E:2E]``)."""
+        """Next forward's slots from expert totals + refresh flag ``ecount``
+        (``place``'s ``ecount_out``; default: those of the last ``place``)."""
+        E = self.experts
         _select_kernel[(1,)](
-            self.info[self.experts:] if ecount is None else ecount, held, placed, R=self.world_size, E=self.experts,
+            self.info[E:] if ecount is None else ecount, held, placed, self.select_hyst,
+            self.info[3 * E:] if ecount is None else ecount[E:],
+            R=self.world_size, E=self.experts,
             B=self.slots, EPN=self.epn, num_warps=4,
         )
 
