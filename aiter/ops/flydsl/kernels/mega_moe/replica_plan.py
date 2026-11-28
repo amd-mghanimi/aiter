@@ -61,8 +61,9 @@ def _count_kernel(ids_ptr, n, hist_ptr, li_ptr, base_ptr, E: tl.constexpr, BLOCK
 @triton.jit
 def _place_kernel(
     hist_ptr, mat_ptr, peers_ptr, epoch_ptr, held_ptr, rank, gate_pct,
-    acs_ptr, e2s_ptr, info_ptr, scratch_ptr,
+    acs_ptr, e2s_ptr, info_ptr, scratch_ptr, ecount_out_ptr,
     R: tl.constexpr, E: tl.constexpr, B: tl.constexpr, EPN: tl.constexpr, P2P: tl.constexpr,
+    ECOUNT_OUT: tl.constexpr,
 ):
     r = tl.arange(0, R)
     e = tl.arange(0, E)
@@ -97,6 +98,8 @@ def _place_kernel(
     ecount = tl.sum(m, axis=0)
     tl.store(info_ptr + e, tl.sum(tl.where(r[:, None] < rank, m, 0), axis=0))
     tl.store(info_ptr + E + e, ecount)
+    if ECOUNT_OUT:
+        tl.store(ecount_out_ptr + e, ecount)
     tl.store(info_ptr + 2 * E + e, tl.sum(tl.where(r[:, None] == rank, m, 0), axis=0))
     owner = e // EPN
     held = tl.load(held_ptr + r[:, None] * B + s[None, :])
@@ -291,7 +294,9 @@ class ReplicaPlanner:
             topk_ids.reshape(-1), n, self.hist, self.local_index, self.block_base,
             E=self.experts, BLOCK=_CBLOCK, num_warps=8)
 
-    def place(self, held: torch.Tensor) -> None:
+    def place(self, held: torch.Tensor, ecount_out: torch.Tensor | None = None) -> None:
+        """``ecount_out``: optional int32 ``[experts]`` that also receives the expert
+        totals (for a later ``select`` after other layers have planned)."""
         p2p = self.exchange_mode == "p2p"
         if self.exchange_mode == "allgather":
             import torch.distributed as dist
@@ -300,7 +305,9 @@ class ReplicaPlanner:
         _place_kernel[(1,)](
             self.hist, self.mat, self.peers, self.epoch, held, self.rank, self.gate_pct,
             self.alloc_cumsum, self.expert_to_slot, self.info, self.scratch,
-            R=self.world_size, E=self.experts, B=self.slots, EPN=self.epn, P2P=p2p, num_warps=1,
+            self.info if ecount_out is None else ecount_out,
+            R=self.world_size, E=self.experts, B=self.slots, EPN=self.epn, P2P=p2p,
+            ECOUNT_OUT=ecount_out is not None, num_warps=1,
         )
 
     def rewrite(self, topk_ids: torch.Tensor) -> torch.Tensor:
@@ -312,16 +319,18 @@ class ReplicaPlanner:
         )
         return self.vids[:n].view(topk_ids.shape)
 
-    def plan(self, topk_ids: torch.Tensor, held: torch.Tensor) -> torch.Tensor:
+    def plan(self, topk_ids: torch.Tensor, held: torch.Tensor,
+             ecount_out: torch.Tensor | None = None) -> torch.Tensor:
         self.count(topk_ids)
-        self.place(held)
+        self.place(held, ecount_out)
         return self.rewrite(topk_ids)
 
-    def select(self, held: torch.Tensor, placed: torch.Tensor) -> None:
-        """Next forward's slots from the expert totals of the last ``place``
-        (``info[E:2E]``; callers may also write them there directly)."""
+    def select(self, held: torch.Tensor, placed: torch.Tensor,
+               ecount: torch.Tensor | None = None) -> None:
+        """Next forward's slots from expert totals ``ecount`` (default: those of the
+        last ``place``, ``info[E:2E]``)."""
         _select_kernel[(1,)](
-            self.info[self.experts:], held, placed, R=self.world_size, E=self.experts,
+            self.info[self.experts:] if ecount is None else ecount, held, placed, R=self.world_size, E=self.experts,
             B=self.slots, EPN=self.epn, num_warps=4,
         )
 
