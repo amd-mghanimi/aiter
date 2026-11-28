@@ -55,6 +55,9 @@ V4_MODEL_DIM, V4_INTER_DIM = 7168, 3072
 # EP8 Muse Spark: 256 experts, top-8.
 MUSE_SPARK_EXPERTS_PER_RANK = 32
 MUSE_SPARK_MODEL_DIM, MUSE_SPARK_INTER_DIM = 4096, 4096
+# Muse with per-batch replica slots (32 home experts + B slots per rank, virtual ids):
+# the expert shape is unchanged, so the Muse tune applies as is.
+MUSE_SPARK_REPLICA_EXPERTS_PER_RANKS = (33, 34, 36, 40)
 # EP4 / EP2 DeepSeek-V4.1-Flash: (world_size, experts_per_rank, model_dim, inter_dim).
 V41_FLASH_EP4_LAYOUT = (4, 96, 5120, 2304)
 V41_FLASH_EP2_LAYOUT = (2, 192, 5120, 2304)
@@ -1253,7 +1256,7 @@ class NetworkProfile:
 
     ``family_experts_per_rank`` lists extra experts-per-rank values (EPLB
     redundant-expert profiles) that share this network's shape and FP4 prelude
-    but have no per-bucket tuner of their own.
+    but have no per-bucket tuner of their own, unless ``family_tuned``.
     """
 
     name: str
@@ -1263,6 +1266,7 @@ class NetworkProfile:
     tuner: Callable[[MegaMoEConfig, _TuningContext], MegaMoEConfig]
     family_experts_per_rank: tuple[int, ...] = ()
     fp4_prelude: bool = False
+    family_tuned: bool = False
 
 
 _NETWORKS = (
@@ -1301,6 +1305,8 @@ _NETWORKS = (
         MUSE_SPARK_MODEL_DIM,
         MUSE_SPARK_INTER_DIM,
         _tune_muse_spark,
+        MUSE_SPARK_REPLICA_EXPERTS_PER_RANKS,
+        family_tuned=True,
     ),
 )
 
@@ -1443,7 +1449,9 @@ def select_mega_moe_config(
     # silently retune its FP4 path. EPLB families inherit their profile's prelude.
     if apply_fp4 and profile is not None and profile.fp4_prelude:
         config = _fp4_common_prelude(config, ctx)
-    if profile is not None and experts_per_rank == profile.experts_per_rank:
+    if profile is not None and (
+        experts_per_rank == profile.experts_per_rank or profile.family_tuned
+    ):
         config = profile.tuner(config, ctx)
     if (
         a_dtype == ACTIVATION_FP4
