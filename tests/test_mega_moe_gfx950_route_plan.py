@@ -998,6 +998,29 @@ def test_stage1_hot_tile_knobs_only_muse_tune(mtpr):
                 ), (world, epr, model_dim, inter_dim, a_dtype, tokens)
 
 
+@pytest.mark.parametrize("mtpr", (1024, 2048, 4096))
+def test_muse_replica_layouts_take_the_muse_tune(mtpr):
+    """Muse with replica slots (32 home experts + 1/2/4/8 slots a rank, virtual ids) keeps the expert shape,
+    so it takes the Muse tune, hot-tile knobs included, at exactly the token counts 32 experts a rank does.
+    """
+    for a_dtype in ("fp4", "fp8"):
+        for tokens in range(1, mtpr + 1):
+            home = select_mega_moe_config(
+                tokens, mtpr, a_dtype=a_dtype, **MUSE_SPARK_SHAPE
+            )
+            for epr in (33, 34, 36, 40):
+                replica = select_mega_moe_config(
+                    tokens,
+                    mtpr,
+                    a_dtype=a_dtype,
+                    **dict(MUSE_SPARK_SHAPE, experts_per_rank=epr),
+                )
+                assert _muse_tuned(replica) == _muse_tuned(home), (a_dtype, tokens, epr)
+                assert _hot_tile_knobs(replica.stage1) == _hot_tile_knobs(
+                    home.stage1
+                ), (a_dtype, tokens, epr)
+
+
 def test_stage1_hot_tile_knobs_keep_the_pinned_digests():
     """The knobs default off and join _LATER_STAGE_KNOBS: no pinned fused selection (V4-Pro, EP4, V4.1-EP8,
     EP2) sets them, a digest table is the same with or without them at their defaults, and turning one on
